@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>sim_bridge</name>
+  <version>0.1.0</version>
+  <description>gym_xarm MuJoCo simulation bridge — publishes ROS2 topics from gym observations</description>
+  <maintainer email="vickyprincevictor22@gmail.com">Vicky Prince</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>image_transport</exec_depend>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_pep8</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

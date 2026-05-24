@@ -1,0 +1,229 @@
+# =============================================================================
+# MYBOTSHOP Robotic Webserver — Configuration
+# Imitation Learning Demo: xARM6 Pick-and-Place
+#
+# Place this file at: /opt/mbs/webserver/config/robot_webserver.yaml
+# Access the interface at: http://localhost:9000
+# Default login: admin / mybotshop
+# =============================================================================
+
+webserver:
+  host: "0.0.0.0"
+  port: 9000
+  auth:
+    username: admin
+    password: mybotshop
+
+  # ROS2 bridge WebSocket (rosbridge_server)
+  ros_bridge:
+    url: "ws://rosbridge:9090"
+    reconnect_interval_ms: 2000
+
+# =============================================================================
+# Dashboard Panel
+# Shows system overview and key pipeline status at a glance
+# =============================================================================
+dashboard:
+  enabled: true
+  widgets:
+    - type: text_status
+      label: "Safety Status"
+      topic: /safety/status
+      msg_type: std_msgs/String
+      field: data
+      color_map:
+        ok: green
+        warn: orange
+        emergency: red
+
+    - type: text_status
+      label: "Policy State"
+      topic: /policy/status
+      msg_type: std_msgs/String
+      field: data
+
+    - type: text_status
+      label: "Recording"
+      topic: /recording/status
+      msg_type: std_msgs/String
+      field: data
+
+    - type: gauge
+      label: "Inference FPS"
+      topic: /policy/inference_fps
+      msg_type: std_msgs/Float32
+      field: data
+      min: 0
+      max: 60
+
+    - type: gauge
+      label: "Policy Confidence"
+      topic: /policy/confidence
+      msg_type: std_msgs/Float32
+      field: data
+      min: 0.0
+      max: 1.0
+
+    - type: counter
+      label: "Episodes Recorded"
+      topic: /recording/episode
+      msg_type: std_msgs/Int32
+      field: data
+
+# =============================================================================
+# Console Panel
+# Primary operator interface: video feeds, joystick, action buttons
+# =============================================================================
+console:
+  enabled: true
+
+  # ----------- Video Control -----------------------------------------------
+  video:
+    streams:
+      - label: "Simulation Camera (Top)"
+        topic: /sim/camera/image_compressed
+        msg_type: sensor_msgs/CompressedImage
+        encoding: compressed
+
+  # ----------- Web Joystick ------------------------------------------------
+  joystick:
+    enabled: true
+    publish_topic: /joy
+    msg_type: sensor_msgs/Joy
+    publish_rate_hz: 30
+    deadzone: 0.05
+
+  # ----------- Action Buttons ----------------------------------------------
+  # These call ROS2 services directly from the browser
+  action_buttons:
+
+    # --- Data Collection ---
+    - label: "▶ Start Demo"
+      icon: record
+      service: /recording/start
+      service_type: std_srvs/Trigger
+      group: "Data Collection"
+      confirm: false
+
+    - label: "⏹ Stop Demo"
+      icon: stop
+      service: /recording/stop
+      service_type: std_srvs/Trigger
+      group: "Data Collection"
+      confirm: false
+
+    - label: "🗑 Discard Demo"
+      icon: delete
+      service: /recording/discard
+      service_type: std_srvs/Trigger
+      group: "Data Collection"
+      confirm: true
+      confirm_message: "Discard this demonstration? This cannot be undone."
+
+    - label: "🔄 Reset Episode"
+      icon: refresh
+      service: /sim/reset
+      service_type: std_srvs/Empty
+      group: "Data Collection"
+
+    # --- Policy Control ---
+    - label: "⚙ Configure Policy"
+      icon: settings
+      ros2_lifecycle:
+        node: /policy_node
+        transition: configure
+      group: "Policy Control"
+
+    - label: "🤖 Activate Policy"
+      icon: play
+      ros2_lifecycle:
+        node: /policy_node
+        transition: activate
+      group: "Policy Control"
+
+    - label: "⏸ Deactivate Policy"
+      icon: pause
+      ros2_lifecycle:
+        node: /policy_node
+        transition: deactivate
+      group: "Policy Control"
+
+    # --- Safety ---
+    - label: "🚨 Manual Override"
+      icon: warning
+      service: /safety/manual_override
+      service_type: std_srvs/Trigger
+      group: "Safety"
+      style: danger
+      confirm: false   # immediate — no confirmation for emergency
+
+    - label: "✅ Resume Policy"
+      icon: check
+      service: /safety/resume_policy
+      service_type: std_srvs/Trigger
+      group: "Safety"
+      confirm: true
+      confirm_message: "Resume autonomous policy? Ensure the workspace is clear."
+
+# =============================================================================
+# Telemetry Panel
+# Live sensor data for debugging and monitoring
+# =============================================================================
+telemetry:
+  enabled: true
+  panels:
+
+    - label: "Joint States"
+      topic: /sim/joint_states
+      msg_type: sensor_msgs/JointState
+      display: joint_bar_chart
+
+    - label: "End-Effector Pose"
+      topic: /sim/ee_pose
+      msg_type: geometry_msgs/PoseStamped
+      display: pose_table
+
+    - label: "Safety Alert"
+      topic: /safety/alert_reason
+      msg_type: std_msgs/String
+      display: log_stream
+      style: warning
+
+    - label: "Policy Diagnostics"
+      topics:
+        - { topic: /policy/inference_fps, label: "FPS" }
+        - { topic: /policy/confidence,    label: "Confidence" }
+      display: time_series
+      history_seconds: 30
+
+# =============================================================================
+# Remote Screen (VNC) — for RViz or other visualisation tools
+# =============================================================================
+remote_screen:
+  enabled: true
+  vnc_url: "ws://sim_stack:5900"
+
+# =============================================================================
+# Settings Panel — allows runtime config updates
+# =============================================================================
+settings:
+  enabled: true
+  editable_params:
+    - node: /safety_watchdog
+      param: confidence_threshold
+      label: "Confidence Threshold"
+      type: float
+      min: 0.0
+      max: 1.0
+
+    - node: /safety_watchdog
+      param: min_inference_fps
+      label: "Min Inference FPS"
+      type: float
+      min: 1.0
+      max: 60.0
+
+    - node: /policy_node
+      param: checkpoint_path
+      label: "Checkpoint Path"
+      type: string

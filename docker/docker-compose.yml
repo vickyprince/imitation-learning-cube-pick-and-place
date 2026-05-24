@@ -1,0 +1,74 @@
+# =============================================================================
+# MYBOTSHOP Imitation Learning Demo — docker-compose
+# Run: docker compose -f docker/docker-compose.yml up
+#
+# Services:
+#   sim_stack  — ROS2 sim + rosbridge (port 9090) + all pipeline nodes
+#   webserver  — MYBOTSHOP Robotic Webserver UI (port 9000)
+#
+# rosbridge runs INSIDE sim_stack (baked into the image via sim_bringup.launch.py).
+# sim_stack gets the network alias "rosbridge" so robot_webserver.yaml needs
+# no changes (it already points at ws://rosbridge:9090).
+# =============================================================================
+name: mbs-il-demo
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # sim_stack: ROS2 Humble + gym_xarm simulation + all pipeline nodes
+  #   Includes: xarm_sim_node, teleop_node, recording_manager,
+  #             safety_watchdog, rosbridge_websocket
+  # ---------------------------------------------------------------------------
+  sim_stack:
+    image: mbs-il-sim:latest
+    build:
+      context: ..
+      dockerfile: docker/sim_stack/Dockerfile
+    # Runs the full simulation bringup launch file by default.
+    # Override CMD for specific one-off tasks, e.g.:
+    #   docker compose run sim_stack \
+    #     python3 /ros2_ws/install/dataset_pipeline/lib/dataset_pipeline/rosbag2_to_lerobot.py
+    command: ros2 launch sim_bridge sim_bringup.launch.py
+    environment:
+      # MuJoCo headless renderer (ARM64 / Apple M1)
+      - MUJOCO_GL=osmesa
+      - PYOPENGL_PLATFORM=osmesa
+      - ROS_DOMAIN_ID=42
+      # Shared secret for webserver auth (match in webserver service)
+      - MBS_WS_SECRET=changeme
+    volumes:
+      # Persist rosbag2 recordings, converted datasets, and checkpoints on host
+      - ../data/bags:/data/bags
+      - ../data/datasets:/data/datasets
+      - ../data/checkpoints:/data/checkpoints
+    ports:
+      # rosbridge WebSocket — browser ↔ ROS2 bridge
+      - "9090:9090"
+    networks:
+      mbs_net:
+        # Network alias lets webserver reach rosbridge at ws://rosbridge:9090
+        # without any changes to robot_webserver.yaml
+        aliases:
+          - rosbridge
+
+  # ---------------------------------------------------------------------------
+  # teleop_ui: Lightweight Python HTTP server serving the standalone
+  # teleoperation HTML page (joystick + camera feed + record buttons).
+  # Opens at http://localhost:9000 — no MYBOTSHOP licence required.
+  # ---------------------------------------------------------------------------
+  teleop_ui:
+    image: python:3.11-slim
+    working_dir: /ui
+    command: python3 -m http.server 9000
+    ports:
+      - "9000:9000"
+    volumes:
+      - ../teleop_ui:/ui:ro
+    networks:
+      - mbs_net
+    depends_on:
+      - sim_stack
+
+networks:
+  mbs_net:
+    driver: bridge

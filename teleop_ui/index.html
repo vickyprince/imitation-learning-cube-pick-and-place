@@ -1,0 +1,969 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>xARM6 Teleoperation — MYBOTSHOP IL Demo</title>
+
+<!-- roslibjs: browser ↔ rosbridge WebSocket -->
+<script src="https://cdn.jsdelivr.net/npm/roslib@1.3.0/build/roslib.min.js"></script>
+<!-- nipplejs: virtual joystick -->
+<script src="https://cdn.jsdelivr.net/npm/nipplejs@0.10.1/dist/nipplejs.min.js"></script>
+
+<style>
+  :root {
+    --bg:       #0f1117;
+    --surface:  #1a1d27;
+    --border:   #2a2d3a;
+    --accent:   #4f8ef7;
+    --green:    #22c55e;
+    --red:      #ef4444;
+    --yellow:   #f59e0b;
+    --text:     #e2e8f0;
+    --muted:    #64748b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 13px;
+    height: 100vh;
+    display: grid;
+    grid-template-rows: 48px 1fr 180px;
+    grid-template-columns: 1fr 320px;
+    gap: 0;
+    overflow: hidden;
+  }
+
+  /* ── Header ── */
+  header {
+    grid-column: 1 / -1;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    gap: 16px;
+  }
+  header h1 { font-size: 15px; font-weight: 600; letter-spacing: 0.02em; }
+  #conn-badge {
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    background: var(--red);
+    color: #fff;
+    transition: background 0.3s;
+  }
+  #conn-badge.ok { background: var(--green); }
+  #ros-url-input {
+    margin-left: auto;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 4px 10px;
+    border-radius: 6px;
+    width: 220px;
+    font-family: inherit;
+    font-size: 12px;
+  }
+  #conn-btn {
+    padding: 4px 14px;
+    border-radius: 6px;
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  /* ── Camera panel ── */
+  #camera-panel {
+    grid-row: 2;
+    grid-column: 1;
+    background: #000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    border-right: 1px solid var(--border);
+  }
+  #camera-canvas {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+  }
+  #camera-overlay {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: rgba(0,0,0,0.6);
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  /* ── Right sidebar ── */
+  #sidebar {
+    grid-row: 2;
+    grid-column: 2;
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    overflow-y: auto;
+    border-bottom: 1px solid var(--border);
+  }
+  .section {
+    border-bottom: 1px solid var(--border);
+    padding: 14px 16px;
+  }
+  .section-title {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+
+  /* Recording */
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn {
+    flex: 1;
+    padding: 8px 6px;
+    border: none;
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s, transform 0.1s;
+  }
+  .btn:active { transform: scale(0.96); }
+  .btn:disabled { opacity: 0.35; cursor: default; }
+  .btn-start  { background: var(--green); color: #fff; }
+  .btn-stop   { background: var(--yellow); color: #000; }
+  .btn-discard{ background: var(--red); color: #fff; }
+  .btn-reset  { background: var(--border); color: var(--text); }
+  .btn-policy-run  { background: #7c3aed; color: #fff; }
+  .btn-policy-stop { background: var(--yellow); color: #000; }
+  .btn-train       { background: #0e7490; color: #fff; }
+  .btn-train-stop  { background: var(--red); color: #fff; }
+
+  /* Training section */
+  .train-params { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px; }
+  .param-group  { display: flex; flex-direction: column; gap: 2px; }
+  .param-group label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .param-group input, .param-group select {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 5px; padding: 4px 6px; font-size: 11px; width: 100%;
+  }
+  .train-progress-bar {
+    height: 6px; background: var(--border); border-radius: 3px;
+    overflow: hidden; margin: 6px 0;
+  }
+  .train-progress-bar .fill {
+    height: 100%; background: #0e7490; border-radius: 3px;
+    transition: width 0.4s ease; width: 0%;
+  }
+  .train-log {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    font-size: 10px; font-family: monospace; color: #94a3b8;
+    height: 90px; overflow-y: auto; padding: 6px 8px;
+    white-space: pre-wrap; word-break: break-all;
+  }
+
+  /* Mode banner — swaps between TELEOP and POLICY */
+  #mode-banner {
+    text-align: center;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    padding: 5px 0 3px;
+    border-bottom: 1px solid var(--border);
+    transition: background 0.4s, color 0.4s;
+  }
+  #mode-banner.teleop { background: #1e293b; color: var(--accent); }
+  #mode-banner.policy { background: #2e1065; color: #c4b5fd; }
+
+  /* Policy metric pills */
+  .policy-metrics {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .metric-pill {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 8px;
+    text-align: center;
+  }
+  .metric-pill .label { font-size: 9px; color: var(--muted); }
+  .metric-pill .value { font-size: 12px; font-weight: 700; margin-top: 2px; }
+
+  /* Task-success toast */
+  #task-toast {
+    display: none;
+    position: fixed;
+    top: 60px; left: 50%; transform: translateX(-50%);
+    background: var(--green);
+    color: #fff;
+    padding: 10px 24px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 700;
+    z-index: 100;
+    box-shadow: 0 4px 20px rgba(34,197,94,0.4);
+    animation: fadein 0.3s ease;
+  }
+  @keyframes fadein { from { opacity:0; top:50px; } to { opacity:1; top:60px; } }
+
+  /* Status pills */
+  .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .status-pill {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  .status-pill .label { font-size: 10px; color: var(--muted); margin-bottom: 4px; }
+  .status-pill .value { font-size: 13px; font-weight: 700; }
+  .value.idle { color: var(--muted); }
+  .value.recording { color: var(--red); }
+  .value.saved { color: var(--green); }
+  .value.ok { color: var(--green); }
+  .value.warn { color: var(--yellow); }
+  .value.emergency { color: var(--red); }
+
+  /* Telemetry */
+  #telem-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  #telem-table td { padding: 3px 4px; }
+  #telem-table td:first-child { color: var(--muted); width: 38px; }
+  #telem-table td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* ── Bottom: Joystick bar ── */
+  #controls {
+    grid-row: 3;
+    grid-column: 1 / -1;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    display: grid;
+    grid-template-columns: 200px 1fr 200px;
+    align-items: center;
+    padding: 10px 24px;
+    gap: 16px;
+  }
+  .joystick-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+  .joy-label { font-size: 10px; color: var(--muted); text-align: center; }
+  #joy-left-zone, #joy-right-zone {
+    width: 120px;
+    height: 120px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    position: relative;
+  }
+  .gripper-zone {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+  .gripper-btn {
+    width: 110px;
+    padding: 10px;
+    border: none;
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    background: var(--border);
+    color: var(--text);
+    transition: background 0.15s;
+  }
+  .gripper-btn:active { background: var(--accent); }
+  #hz-display { font-size: 11px; color: var(--muted); text-align: center; }
+  #log { font-size: 10px; color: var(--muted); text-align: center; max-height: 40px; overflow: hidden; }
+</style>
+</head>
+<body>
+
+<!-- Task success toast -->
+<div id="task-toast">🎉 Task Complete — Cube Lifted!</div>
+
+<!-- Mode banner -->
+<div id="mode-banner" class="teleop" style="grid-column:1/-1;grid-row:1;align-self:end;margin-top:48px;">
+  ● TELEOP MODE
+</div>
+
+<!-- ── Header ── -->
+<header>
+  <h1>xARM6 Imitation Learning</h1>
+  <span id="conn-badge">DISCONNECTED</span>
+  <input id="ros-url-input" type="text" value="ws://localhost:9090">
+  <button id="conn-btn" onclick="connectROS()">Connect</button>
+</header>
+
+<!-- ── Camera ── -->
+<div id="camera-panel">
+  <canvas id="camera-canvas" width="640" height="480"></canvas>
+  <div id="camera-overlay">No image yet</div>
+</div>
+
+<!-- ── Sidebar ── -->
+<div id="sidebar">
+
+  <!-- Recording controls -->
+  <div class="section">
+    <div class="section-title">Data Collection</div>
+    <div class="btn-row" style="margin-bottom:8px">
+      <button class="btn btn-start"   id="btn-start"   onclick="callService('/recording/start')"  disabled>▶ Start</button>
+      <button class="btn btn-stop"    id="btn-stop"    onclick="callService('/recording/stop')"   disabled>⏹ Stop</button>
+      <button class="btn btn-discard" id="btn-discard" onclick="discardEpisode()"                 disabled>🗑 Discard</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-reset"   id="btn-reset"   onclick="callServiceEmpty('/sim/reset')"   disabled>🔄 Reset Env</button>
+    </div>
+  </div>
+
+  <!-- Policy control -->
+  <div class="section">
+    <div class="section-title">Policy Deployment</div>
+    <div class="btn-row" style="margin-bottom:8px">
+      <button class="btn btn-policy-run"  id="btn-policy-run"  onclick="runPolicy()"  disabled>▶ Run Policy</button>
+      <button class="btn btn-policy-stop" id="btn-policy-stop" onclick="stopPolicy()" disabled>⏹ Stop Policy</button>
+    </div>
+    <div class="policy-metrics">
+      <div class="metric-pill">
+        <div class="label">Mode</div>
+        <div class="value" id="policy-mode" style="color:var(--accent)">TELEOP</div>
+      </div>
+      <div class="metric-pill">
+        <div class="label">FPS</div>
+        <div class="value" id="policy-fps">—</div>
+      </div>
+      <div class="metric-pill">
+        <div class="label">Confidence</div>
+        <div class="value" id="policy-conf">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Train Policy -->
+  <div class="section">
+    <div class="section-title">Train Policy</div>
+    <div class="train-params">
+      <div class="param-group">
+        <label>Epochs</label>
+        <input type="number" id="train-epochs" value="2" min="1" max="500">
+      </div>
+      <div class="param-group">
+        <label>Batch Size</label>
+        <select id="train-batch">
+          <option value="4">4</option>
+          <option value="8" selected>8</option>
+          <option value="16">16</option>
+          <option value="32">32</option>
+        </select>
+      </div>
+      <div class="param-group">
+        <label>Learning Rate</label>
+        <select id="train-lr">
+          <option value="0.001">1e-3</option>
+          <option value="0.0001" selected>1e-4</option>
+          <option value="0.00001">1e-5</option>
+        </select>
+      </div>
+      <div class="param-group">
+        <label>Status</label>
+        <div style="padding:4px 0;font-size:11px;font-weight:700;" id="train-status-pill">IDLE</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:12px;">
+      <input type="checkbox" id="train-auto-convert" checked style="width:14px;height:14px;cursor:pointer;">
+      <label for="train-auto-convert" style="cursor:pointer;color:var(--text);">
+        Auto-convert bags before training
+      </label>
+    </div>
+    <div class="btn-row" style="margin-bottom:6px">
+      <button class="btn btn-train"      id="btn-train"      onclick="startTraining()" disabled>▶ Train</button>
+      <button class="btn btn-train-stop" id="btn-train-stop" onclick="stopTraining()"  disabled>⏹ Stop</button>
+    </div>
+    <div class="train-progress-bar"><div class="fill" id="train-fill"></div></div>
+    <div class="train-log" id="train-log">Waiting for training manager…</div>
+  </div>
+
+  <!-- Status -->
+  <div class="section">
+    <div class="section-title">Status</div>
+    <div class="status-grid">
+      <div class="status-pill">
+        <div class="label">Recording</div>
+        <div class="value idle" id="rec-status">idle</div>
+      </div>
+      <div class="status-pill">
+        <div class="label">Episodes</div>
+        <div class="value" id="episode-count">0</div>
+      </div>
+      <div class="status-pill">
+        <div class="label">Safety</div>
+        <div class="value ok" id="safety-status">ok</div>
+      </div>
+      <div class="status-pill">
+        <div class="label">Sim Hz</div>
+        <div class="value" id="sim-hz">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- EEF telemetry -->
+  <div class="section">
+    <div class="section-title">End-Effector</div>
+    <table id="telem-table">
+      <tr><td>X</td><td id="ee-x">—</td></tr>
+      <tr><td>Y</td><td id="ee-y">—</td></tr>
+      <tr><td>Z</td><td id="ee-z">—</td></tr>
+      <tr><td>Qx</td><td id="ee-qx">—</td></tr>
+      <tr><td>Qy</td><td id="ee-qy">—</td></tr>
+      <tr><td>Qz</td><td id="ee-qz">—</td></tr>
+      <tr><td>Qw</td><td id="ee-qw">—</td></tr>
+      <tr><td>Grip</td><td id="ee-grip">—</td></tr>
+    </table>
+  </div>
+
+  <!-- F/T -->
+  <div class="section">
+    <div class="section-title">F/T Wrench</div>
+    <table id="telem-table">
+      <tr><td>Fx</td><td id="ft-fx">—</td></tr>
+      <tr><td>Fy</td><td id="ft-fy">—</td></tr>
+      <tr><td>Fz</td><td id="ft-fz">—</td></tr>
+      <tr><td>Tx</td><td id="ft-tx">—</td></tr>
+      <tr><td>Ty</td><td id="ft-ty">—</td></tr>
+      <tr><td>Tz</td><td id="ft-tz">—</td></tr>
+    </table>
+  </div>
+
+  <!-- Log -->
+  <div class="section">
+    <div class="section-title">Log</div>
+    <div id="log">—</div>
+  </div>
+
+</div>
+
+<!-- ── Controls ── -->
+<div id="controls">
+  <div class="joystick-wrap">
+    <div id="joy-left-zone"></div>
+    <div class="joy-label">Left stick → X / Y plane<br>(axes 0, 1)</div>
+  </div>
+  <div style="text-align:center">
+    <div id="hz-display">Joy publish rate: — Hz</div>
+    <div style="margin-top:6px; font-size:10px; color:var(--muted)">Touch joystick circles to move the arm</div>
+  </div>
+  <div class="joystick-wrap">
+    <div id="joy-right-zone"></div>
+    <div class="joy-label">Right stick → Z (up/down)<br>(axis 3)</div>
+  </div>
+</div>
+
+<script>
+// ============================================================================
+// ROS connection
+// ============================================================================
+let ros = null;
+let joyPub = null;
+let listeners = [];
+
+// Joy state — updated by nipplejs, published at JOY_HZ
+const joyAxes    = [0, 0, 0, 0, 0, 0];  // axes[0]=dy axes[1]=dx axes[3]=dz
+const joyButtons = [0, 0, 0, 0];         // buttons[0]=grip_close [1]=grip_open
+const JOY_HZ = 30;
+let joyInterval = null;
+let joyPublishCount = 0;
+let hzTimer = null;
+
+function connectROS() {
+  const url = document.getElementById('ros-url-input').value.trim();
+  if (ros) { ros.close(); ros = null; }
+
+  ros = new ROSLIB.Ros({ url });
+
+  ros.on('connection', () => {
+    log('Connected to ' + url);
+    setBadge(true);
+    setupPublisher();
+    setupSubscribers();
+    setupTrainingSubscribers();
+    enableButtons(true);
+    startJoyPublish();
+  });
+
+  ros.on('error', (e) => { log('ROS error: ' + e); setBadge(false); enableButtons(false); });
+  ros.on('close', ()  => { log('Disconnected'); setBadge(false); enableButtons(false); stopJoyPublish(); });
+}
+
+function setBadge(ok) {
+  const b = document.getElementById('conn-badge');
+  b.textContent = ok ? 'CONNECTED' : 'DISCONNECTED';
+  b.className = ok ? 'ok' : '';
+}
+
+function enableButtons(on) {
+  ['btn-start','btn-stop','btn-discard','btn-reset',
+   'btn-policy-run','btn-policy-stop',
+   'btn-train','btn-train-stop'].forEach(id => {
+    document.getElementById(id).disabled = !on;
+  });
+}
+
+// ============================================================================
+// Training pipeline
+// ============================================================================
+let _trainingStatus = 'idle';
+
+function startTraining() {
+  if (!ros) return;
+
+  const autoConvert = document.getElementById('train-auto-convert').checked;
+
+  // 1. Publish config
+  const config = {
+    bags_dir:     '/data/bags',
+    dataset_dir:  '/data/datasets/xarm_lift_v1',
+    output_dir:   '/data/checkpoints/xarm_lift_v1',
+    task_name:    'xarm_lift',
+    auto_convert: autoConvert,
+    epochs:       parseInt(document.getElementById('train-epochs').value) || 2,
+    batch_size:   parseInt(document.getElementById('train-batch').value)  || 8,
+    lr:           parseFloat(document.getElementById('train-lr').value)   || 1e-4,
+  };
+
+  const cfgTopic = new ROSLIB.Topic({ ros, name: '/training/config', messageType: 'std_msgs/String' });
+  cfgTopic.publish(new ROSLIB.Message({ data: JSON.stringify(config) }));
+  cfgTopic.unadvertise();
+
+  // 2. Call /training/start
+  const svc = new ROSLIB.Service({ ros, name: '/training/start', serviceType: 'std_srvs/Trigger' });
+  svc.callService(new ROSLIB.ServiceRequest({}), (r) => {
+    if (r.success) {
+      trainLog('▶ ' + r.message);
+      document.getElementById('train-fill').style.width = '0%';
+    } else {
+      trainLog('✗ ' + r.message);
+    }
+  });
+}
+
+function stopTraining() {
+  if (!ros) return;
+  const svc = new ROSLIB.Service({ ros, name: '/training/stop', serviceType: 'std_srvs/Trigger' });
+  svc.callService(new ROSLIB.ServiceRequest({}), (r) => {
+    trainLog('⏹ ' + r.message);
+  });
+}
+
+function trainLog(line) {
+  const box = document.getElementById('train-log');
+  if (!box) return;
+  box.textContent += line + '\n';
+  box.scrollTop = box.scrollHeight;
+}
+
+function setupTrainingSubscribers() {
+  if (!ros) return;
+
+  sub('/training/status', 'std_msgs/String', (m) => {
+    _trainingStatus = m.data;
+    const pill = document.getElementById('train-status-pill');
+    if (!pill) return;
+    const colors = {
+      idle:       'var(--muted)',
+      converting: '#d97706',   // amber — conversion phase
+      running:    '#0e7490',   // teal  — training phase
+      done:       'var(--green)',
+      error:      'var(--red)',
+    };
+    const labels = {
+      idle:       'IDLE',
+      converting: 'CONVERTING',
+      running:    'TRAINING',
+      done:       'DONE',
+      error:      'ERROR',
+    };
+    pill.textContent = labels[m.data] || m.data.toUpperCase();
+    pill.style.color = colors[m.data] || 'var(--text)';
+
+    // Disable Train button while anything is active; enable Stop when active
+    const active = (m.data === 'converting' || m.data === 'running');
+    const btnTrain = document.getElementById('btn-train');
+    const btnStop  = document.getElementById('btn-train-stop');
+    if (btnTrain) btnTrain.disabled = active;
+    if (btnStop)  btnStop.disabled  = !active;
+
+    if (m.data === 'done') {
+      trainLog('✓ Checkpoint saved — click Run Policy to deploy.');
+    }
+  });
+
+  sub('/training/log', 'std_msgs/String', (m) => {
+    trainLog(m.data);
+  });
+
+  sub('/training/progress', 'std_msgs/Float32', (m) => {
+    const pct = Math.min(100, Math.max(0, m.data));
+    const fill = document.getElementById('train-fill');
+    if (fill) fill.style.width = pct + '%';
+  });
+}
+
+function log(msg) {
+  document.getElementById('log').textContent = msg;
+}
+
+// ============================================================================
+// Publisher
+// ============================================================================
+function setupPublisher() {
+  joyPub = new ROSLIB.Topic({
+    ros,
+    name: '/joy',
+    messageType: 'sensor_msgs/Joy',
+  });
+  // advertise() is required — tells rosbridge the message type so it
+  // doesn't silently drop publishes from unknown topics
+  joyPub.advertise();
+}
+
+function startJoyPublish() {
+  stopJoyPublish();
+  joyInterval = setInterval(publishJoy, 1000 / JOY_HZ);
+  hzTimer = setInterval(() => {
+    document.getElementById('hz-display').textContent =
+      'Joy publish rate: ' + joyPublishCount + ' Hz';
+    joyPublishCount = 0;
+  }, 1000);
+}
+
+function stopJoyPublish() {
+  if (joyInterval) clearInterval(joyInterval);
+  if (hzTimer) clearInterval(hzTimer);
+  joyInterval = null; hzTimer = null;
+}
+
+function publishJoy() {
+  if (!joyPub) return;
+  joyPub.publish(new ROSLIB.Message({
+    header: { stamp: { secs: 0, nsecs: 0 }, frame_id: '' },
+    axes: [...joyAxes],
+    buttons: [...joyButtons],
+  }));
+  joyPublishCount++;
+}
+
+// ============================================================================
+// Subscribers
+// ============================================================================
+function setupSubscribers() {
+  listeners.forEach(l => l.unsubscribe());
+  listeners = [];
+
+  // Recording status
+  sub('/recording/status', 'std_msgs/String', (m) => {
+    const el = document.getElementById('rec-status');
+    el.textContent = m.data;
+    el.className = 'value ' + m.data;
+  });
+
+  // Episode counter
+  sub('/recording/episode', 'std_msgs/Int32', (m) => {
+    document.getElementById('episode-count').textContent = m.data;
+  });
+
+  // Safety status
+  sub('/safety/status', 'std_msgs/String', (m) => {
+    const el = document.getElementById('safety-status');
+    el.textContent = m.data;
+    el.className = 'value ' + m.data;
+  });
+
+  // Joint states → EEF telemetry (32D packed in position[])
+  // Indices: 0=ee_x,1=ee_y,2=ee_z, 3=qx,4=qy,5=qz,6=qw, 13=gripper
+  sub('/sim/joint_states', 'sensor_msgs/JointState', (m) => {
+    const p = m.position;
+    if (!p || p.length < 14) return;
+    setTelem('ee-x',  p[0]);
+    setTelem('ee-y',  p[1]);
+    setTelem('ee-z',  p[2]);
+    setTelem('ee-qx', p[3]);
+    setTelem('ee-qy', p[4]);
+    setTelem('ee-qz', p[5]);
+    setTelem('ee-qw', p[6]);
+    setTelem('ee-grip', p[13]);
+  });
+
+  // Wrench
+  sub('/sim/wrench', 'geometry_msgs/WrenchStamped', (m) => {
+    const f = m.wrench.force, t = m.wrench.torque;
+    setTelem('ft-fx', f.x); setTelem('ft-fy', f.y); setTelem('ft-fz', f.z);
+    setTelem('ft-tx', t.x); setTelem('ft-ty', t.y); setTelem('ft-tz', t.z);
+  });
+
+  // Sim Hz from joint_states header timestamps
+  let lastStamp = null;
+  sub('/sim/joint_states', 'sensor_msgs/JointState', (m) => {
+    const now = m.header.stamp.secs + m.header.stamp.nsecs * 1e-9;
+    if (lastStamp) {
+      const dt = now - lastStamp;
+      if (dt > 0) document.getElementById('sim-hz').textContent = (1/dt).toFixed(1) + ' Hz';
+    }
+    lastStamp = now;
+  });
+
+  // Policy metrics
+  sub('/policy/status', 'std_msgs/String', (m) => {
+    if (m.data === 'active') {
+      setMode('policy');
+      document.getElementById('policy-mode').textContent = 'POLICY';
+      document.getElementById('policy-mode').style.color = '#c4b5fd';
+    } else if (m.data === 'inactive' || m.data === 'unconfigured') {
+      setMode('teleop');
+      document.getElementById('policy-mode').textContent = 'TELEOP';
+      document.getElementById('policy-mode').style.color = 'var(--accent)';
+    }
+  });
+
+  sub('/policy/inference_fps', 'std_msgs/Float32', (m) => {
+    document.getElementById('policy-fps').textContent = m.data.toFixed(1);
+  });
+
+  sub('/policy/confidence', 'std_msgs/Float32', (m) => {
+    document.getElementById('policy-conf').textContent = m.data.toFixed(3);
+  });
+
+  // Task completion — show toast and auto-return to teleop mode
+  sub('/sim/task_complete', 'std_msgs/Bool', (m) => {
+    if (m.data) {
+      const toast = document.getElementById('task-toast');
+      toast.style.display = 'block';
+      setMode('teleop');
+      document.getElementById('policy-mode').textContent = 'DONE ✓';
+      document.getElementById('policy-mode').style.color = 'var(--green)';
+      log('🎉 Task complete! Click Reset Env for next episode.');
+      setTimeout(() => { toast.style.display = 'none'; }, 4000);
+    }
+  });
+
+  // Camera feed
+  subCamera('/sim/camera/image_compressed');
+}
+
+function sub(topic, type, cb) {
+  const l = new ROSLIB.Topic({ ros, name: topic, messageType: type, throttle_rate: 100 });
+  l.subscribe(cb);
+  listeners.push(l);
+}
+
+function subCamera(topic) {
+  const l = new ROSLIB.Topic({
+    ros,
+    name: topic,
+    messageType: 'sensor_msgs/CompressedImage',
+    throttle_rate: 66,   // ~15 fps from bridge (sim runs at 14 Hz)
+    queue_length: 1,
+  });
+  l.subscribe((m) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.getElementById('camera-canvas');
+      canvas.width  = img.width;
+      canvas.height = img.height;
+      canvas.getContext('2d').drawImage(img, 0, 0);
+      document.getElementById('camera-overlay').textContent =
+        img.width + '×' + img.height;
+    };
+    img.src = 'data:image/jpeg;base64,' + m.data;
+  });
+  listeners.push(l);
+}
+
+function setTelem(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = (typeof val === 'number') ? val.toFixed(4) : val;
+}
+
+// ============================================================================
+// Service calls
+// ============================================================================
+function callService(name) {
+  if (!ros) return;
+  const svc = new ROSLIB.Service({ ros, name, serviceType: 'std_srvs/Trigger' });
+  svc.callService(new ROSLIB.ServiceRequest({}), (r) => {
+    log(name + ': ' + (r.success ? 'OK — ' + r.message : 'FAILED — ' + r.message));
+  });
+}
+
+function callServiceEmpty(name) {
+  if (!ros) return;
+  const svc = new ROSLIB.Service({ ros, name, serviceType: 'std_srvs/Empty' });
+  svc.callService(new ROSLIB.ServiceRequest({}), () => { log(name + ': OK'); });
+}
+
+function discardEpisode() {
+  if (!confirm('Discard this demonstration? This cannot be undone.')) return;
+  callService('/recording/discard');
+}
+
+// ============================================================================
+// Policy lifecycle — ROS2 managed lifecycle via rosbridge
+// Transition IDs: CONFIGURE=1, CLEANUP=2, ACTIVATE=3, DEACTIVATE=4
+// ============================================================================
+let policyState = 'unconfigured';  // unconfigured | configured | active | inactive
+
+function lifecycleTransition(transitionId, label, onSuccess) {
+  if (!ros) return;
+  const svc = new ROSLIB.Service({
+    ros,
+    name: '/policy_node/change_state',
+    serviceType: 'lifecycle_msgs/ChangeState',
+  });
+  svc.callService(
+    new ROSLIB.ServiceRequest({ transition: { id: transitionId, label: '' } }),
+    (r) => {
+      if (r && r.success) {
+        log('Policy: ' + label + ' OK');
+        if (onSuccess) onSuccess();
+      } else {
+        log('Policy: ' + label + ' FAILED');
+      }
+    },
+    (err) => { log('Policy service error: ' + err); }
+  );
+}
+
+function runPolicy() {
+  if (!ros) return;
+  log('Policy: starting…');
+  const svc = new ROSLIB.Service({ ros, name: '/policy/run', serviceType: 'std_srvs/Trigger' });
+  svc.callService(new ROSLIB.ServiceRequest({}), (r) => {
+    if (r && r.success) {
+      policyState = 'active';
+      setMode('policy');
+      document.getElementById('policy-mode').textContent = 'POLICY';
+      document.getElementById('policy-mode').style.color = '#c4b5fd';
+      log('Policy: ' + r.message);
+    } else {
+      log('Policy run FAILED: ' + (r ? r.message : 'no response'));
+    }
+  }, (err) => { log('Policy run error: ' + err); });
+}
+
+function stopPolicy() {
+  if (!ros) return;
+  const svc = new ROSLIB.Service({ ros, name: '/policy/stop', serviceType: 'std_srvs/Trigger' });
+  svc.callService(new ROSLIB.ServiceRequest({}), (r) => {
+    policyState = 'inactive';
+    setMode('teleop');
+    document.getElementById('policy-mode').textContent = 'TELEOP';
+    document.getElementById('policy-mode').style.color = 'var(--accent)';
+    document.getElementById('policy-fps').textContent  = '—';
+    document.getElementById('policy-conf').textContent = '—';
+    log('Policy stopped — joystick active');
+  }, (err) => { log('Policy stop error: ' + err); });
+}
+
+function setMode(mode) {
+  const banner = document.getElementById('mode-banner');
+  if (mode === 'policy') {
+    banner.className = 'policy';
+    banner.textContent = '● POLICY MODE — ACT Inference Running';
+  } else {
+    banner.className = 'teleop';
+    banner.textContent = '● TELEOP MODE';
+  }
+}
+
+// ============================================================================
+// Joystick (nipplejs)
+// ============================================================================
+window.addEventListener('load', () => {
+  // Guard: check libraries loaded
+  if (typeof ROSLIB === 'undefined') {
+    document.getElementById('log').textContent =
+      'ERROR: roslibjs failed to load from CDN. Check your internet connection.';
+    document.getElementById('log').style.color = '#ef4444';
+    return;
+  }
+  if (typeof nipplejs === 'undefined') {
+    document.getElementById('log').textContent =
+      'ERROR: nipplejs failed to load from CDN. Check your internet connection.';
+    document.getElementById('log').style.color = '#ef4444';
+  }
+
+  // Left joystick: X/Y plane
+  // teleop_node: axes[0]=left_stick_X → dy,  axes[1]=left_stick_Y → dx
+  // nipplejs: vector.x right=+1, vector.y up=+1
+  const jLeft = nipplejs.create({
+    zone: document.getElementById('joy-left-zone'),
+    mode: 'static',
+    position: { left: '50%', top: '50%' },
+    color: '#4f8ef7',
+    size: 90,
+    restJoystick: true,
+  });
+  jLeft.on('move', (_, d) => {
+    joyAxes[0] =  (d.vector.x || 0);   // left-right → robot Y (lateral)
+    joyAxes[1] =  (d.vector.y || 0);   // up push → forward, down push → back
+  });
+  jLeft.on('end', () => { joyAxes[0] = 0; joyAxes[1] = 0; });
+
+  // Right joystick: Z axis — axes[3]=right_stick_Y → dz
+  const jRight = nipplejs.create({
+    zone: document.getElementById('joy-right-zone'),
+    mode: 'static',
+    position: { left: '50%', top: '50%' },
+    color: '#22c55e',
+    size: 90,
+    restJoystick: true,
+  });
+  jRight.on('move', (_, d) => {
+    joyAxes[3] = (d.vector.y || 0);   // up → arm rises, down → arm lowers
+  });
+  jRight.on('end', () => { joyAxes[3] = 0; });
+
+  // Keyboard gripper: C = close, O = open
+  // Hold button active for 500ms (≈15 publish cycles) to ensure the
+  // teleop_node callback fires at least once per keypress.
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'c' || e.key === 'C') {
+      joyButtons[0] = 1; joyButtons[1] = 0;
+      log('Gripper: CLOSE (C)');
+      setTimeout(() => { joyButtons[0] = 0; }, 500);
+    }
+    if (e.key === 'o' || e.key === 'O') {
+      joyButtons[0] = 0; joyButtons[1] = 1;
+      log('Gripper: OPEN (O)');
+      setTimeout(() => { joyButtons[1] = 0; }, 500);
+    }
+  });
+
+  // Auto-connect on load
+  connectROS();
+});
+</script>
+</body>
+</html>
