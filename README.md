@@ -32,28 +32,99 @@ Stage 7  Safety           watchdog_node    confidence + joint limits + manual ov
 
 ---
 
-## Quick Start (Mac M1 / Apple Silicon)
-
-### Prerequisites
-- Docker Desktop for Apple Silicon (ARM64)
-
-### 1. Clone and build
+## Quick Start
 
 ```bash
-git clone https://github.com/<you>/mybotshop-il-demo
-cd mybotshop-il-demo
-docker compose -f docker/docker-compose.yml build sim_stack
+git clone https://github.com/vickyprince/imitation-learning-cube-pick-and-place.git
+cd imitation-learning-cube-pick-and-place
 ```
 
-### 2. Start the stack
+---
+
+### Mac M1 / Apple Silicon
+
+**Prerequisites:** Docker Desktop for Apple Silicon (ARM64)
 
 ```bash
+docker compose -f docker/docker-compose.yml build sim_stack
 docker compose -f docker/docker-compose.yml up
 ```
 
-Open **http://localhost:9000** in your browser — no login required.
+Open **http://localhost:9000** — no login required. The camera feed appears within a few seconds.
 
-The camera feed appears within a few seconds.
+For policy training, run `train_act.py` directly on the Mac (outside Docker) to use the MPS GPU — ~10× faster than Docker CPU:
+
+```bash
+python3 training/train_act.py \
+    --dataset_dir data/datasets/xarm_lift_v1 \
+    --output_dir  data/checkpoints/xarm_lift_v1 \
+    --epochs 200
+```
+
+---
+
+### Ubuntu / NVIDIA GPU
+
+Docker is the recommended approach on Ubuntu too — it handles all ROS2 and MuJoCo dependencies automatically. The only difference from Mac is that NVIDIA GPUs use the EGL renderer instead of OSMesa.
+
+**Prerequisites:** Docker + [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+
+```bash
+# Install NVIDIA Container Toolkit (if not already installed)
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+Then build and run with EGL (GPU-accelerated headless rendering):
+
+```bash
+# Override the MuJoCo GL backend for NVIDIA
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+  docker compose -f docker/docker-compose.yml build sim_stack
+
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+  docker compose -f docker/docker-compose.yml up
+```
+
+Open **http://localhost:9000** — same UI as Mac.
+
+Training auto-detects CUDA, so running `train_act.py` on the host will use the GPU automatically:
+
+```bash
+python3 training/train_act.py \
+    --dataset_dir data/datasets/xarm_lift_v1 \
+    --output_dir  data/checkpoints/xarm_lift_v1 \
+    --epochs 200
+# Device: cuda  ← printed automatically if CUDA is available
+```
+
+**Alternative: run natively without Docker** (Ubuntu only, since ROS2 Humble is Linux-native):
+
+```bash
+# 1. Install ROS2 Humble: https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html
+
+# 2. Install Python dependencies
+pip install "mujoco>=2.3.7,<3.0.0" gymnasium==0.29.1 gymnasium-robotics==1.2.4 \
+            gym-xarm==0.1.1 opencv-python-headless "numpy<2" \
+            pyarrow pandas torch torchvision einops safetensors
+
+# 3. Build the ROS2 workspace
+source /opt/ros/humble/setup.bash
+cd ros2_ws && colcon build --symlink-install
+source install/setup.bash
+
+# 4. Launch the full stack
+export MUJOCO_GL=glfw   # use glfw if you have a display; egl for headless
+ros2 launch sim_bridge sim_bringup.launch.py
+
+# 5. Serve the browser UI (separate terminal)
+cd teleop_ui && python3 -m http.server 9000
+```
 
 ---
 
@@ -92,9 +163,9 @@ The browser joystick publishes `sensor_msgs/Joy` on `/joy`:
 
 ```
 left stick X/Y  →  EEF lateral (±5 mm/step)
-right stick Y   →  EEF height  (±5 mm/step)
-Button A        →  gripper close
-Button B        →  gripper open
+right stick Z   →  EEF height  (±5 mm/step)
+Button C        →  gripper close
+Button O        →  gripper open
 ```
 
 The `teleop_node` converts these to Cartesian delta targets on `/sim/joint_command`.
@@ -110,7 +181,7 @@ The `teleop_node` converts these to Cartesian delta targets on `/sim/joint_comma
 
 Bags are named `episode_XXXX_YYYYMMDD_HHMMSS/` and contain all five topics at full rate.
 
-Aim for **25+ demonstrations** covering varied cube positions for reliable generalization.
+Aim for **100+ demonstrations** covering varied cube positions for reliable generalization.
 
 ---
 
