@@ -63,7 +63,7 @@ python3 training/train_act.py \
 
 ---
 
-### Ubuntu / NVIDIA GPU
+### Ubuntu
 
 Docker is the recommended approach on Ubuntu too — it handles all ROS2 and MuJoCo dependencies automatically. The only difference from Mac is that NVIDIA GPUs use the EGL renderer instead of OSMesa.
 
@@ -101,29 +101,6 @@ python3 training/train_act.py \
     --output_dir  data/checkpoints/xarm_lift_v1 \
     --epochs 200
 # Device: cuda  ← printed automatically if CUDA is available
-```
-
-**Alternative: run natively without Docker** (Ubuntu only, since ROS2 Humble is Linux-native):
-
-```bash
-# 1. Install ROS2 Humble: https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html
-
-# 2. Install Python dependencies
-pip install "mujoco>=2.3.7,<3.0.0" gymnasium==0.29.1 gymnasium-robotics==1.2.4 \
-            gym-xarm==0.1.1 opencv-python-headless "numpy<2" \
-            pyarrow pandas torch torchvision einops safetensors
-
-# 3. Build the ROS2 workspace
-source /opt/ros/humble/setup.bash
-cd ros2_ws && colcon build --symlink-install
-source install/setup.bash
-
-# 4. Launch the full stack
-export MUJOCO_GL=glfw   # use glfw if you have a display; egl for headless
-ros2 launch sim_bridge sim_bringup.launch.py
-
-# 5. Serve the browser UI (separate terminal)
-cd teleop_ui && python3 -m http.server 9000
 ```
 
 ---
@@ -203,7 +180,7 @@ Tweakable parameters in the UI before clicking Train:
 | Learning Rate | 1e-4 | Initial LR (cosine annealed to 0) |
 | Auto-convert bags | ✓ | Runs conversion before training |
 
-**For full-quality training on Mac M1** (uses MPS GPU, ~10× faster than Docker CPU):
+**For full-quality training and complete controll over training:
 
 ```bash
 python3 training/train_act.py \
