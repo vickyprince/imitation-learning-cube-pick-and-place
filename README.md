@@ -3,21 +3,17 @@
 **ROS2-native robotic learning operations platform for xARM6 pick-and-place,
 integrated end-to-end with a browser-based teleoperation UI.**
 
-
-<video src="https://github.com/user-attachments/assets/6ddb8433-11dd-4262-95a0-f0d665992b32" autoplay loop muted playsinline width="100%"></video>
-
 > The full pipeline — demonstration collection, dataset conversion, policy
 > training, and deployment — is driven from the browser. No terminal access
 > is required during normal operation.
 
+**ACT policy inference — autonomous pick-and-place after training:**
+
+<video src="https://github.com/user-attachments/assets/6ddb8433-11dd-4262-95a0-f0d665992b32" autoplay loop muted playsinline width="100%"></video>
+
 ---
 
 ## Pipeline Overview
-
-
-<video src="https://github.com/user-attachments/assets/40d00337-25f4-41e1-b3c5-dd2ddf4488a7" autoplay loop muted playsinline width="100%"></video>
-
-
 
 ```
 Browser UI (http://localhost:9000)
@@ -158,6 +154,10 @@ The `teleop_node` converts these to Cartesian delta targets on `/sim/joint_comma
 ---
 
 ### Stage 3 — Recording Demonstrations
+
+**Teleoperation data collection via browser joystick:**
+
+<video src="https://github.com/user-attachments/assets/40d00337-25f4-41e1-b3c5-dd2ddf4488a7" autoplay loop muted playsinline width="100%"></video>
 
 1. Click **▶ Start Demo** → calls `/recording/start`
 2. Use the joystick to pick the cube and place it on the target
