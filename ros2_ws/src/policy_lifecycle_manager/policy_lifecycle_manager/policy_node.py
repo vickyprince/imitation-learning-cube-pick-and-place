@@ -409,7 +409,7 @@ class PolicyLifecycleManager(LifecycleNode):
         if getattr(self, "_use_vision", False) and image is not None:
             # BGR (OpenCV) → RGB → resize → normalise → CHW tensor
             img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (224, 224))
+            img = cv2.resize(img, (112, 112))
             img = img.astype(np.float32) / 255.0
             img = (img - _IMG_MEAN.reshape(1, 1, 3)) / _IMG_STD.reshape(1, 1, 3)
             img_t = torch.from_numpy(
