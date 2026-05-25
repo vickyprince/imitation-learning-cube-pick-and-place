@@ -4,7 +4,7 @@
 integrated end-to-end with a browser-based teleoperation UI.**
 
 
-<video src="[https://github.com/user-attachments/assets/YOUR-ID.mp4](https://github.com/user-attachments/assets/6ddb8433-11dd-4262-95a0-f0d665992b32)" autoplay loop muted playsinline width="100%"></video>
+<video src="https://github.com/user-attachments/assets/6ddb8433-11dd-4262-95a0-f0d665992b32" autoplay loop muted playsinline width="100%"></video>
 
 > The full pipeline — demonstration collection, dataset conversion, policy
 > training, and deployment — is driven from the browser. No terminal access
