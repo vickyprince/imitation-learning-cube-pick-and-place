@@ -266,6 +266,52 @@ While active, the UI shows:
 and executes them before re-querying — this prevents compounding errors from
 noisy single-step predictions.
 
+**Success rate:** The UI tracks picks per session — each "Run Policy" click is
+one attempt; a successful cube lift increments the counter automatically.
+
+---
+
+### Policy Architecture
+
+Two modes are supported — the checkpoint auto-selects which model to load at inference time.
+
+**State-only (fast baseline):**
+```
+32D proprioceptive state
+       ↓
+  Residual MLP (512 hidden, LayerNorm, GELU)
+       ↓
+  4D EEF delta action  [dx, dy, dz, gripper]
+```
+
+**Vision + State (best accuracy):**
+```
+Camera image (84×84 RGB)          32D proprioceptive state
+       ↓                                    │
+  ResNet18 backbone                         │
+  (ImageNet pretrained,                     │
+   fine-tuned end-to-end)                   │
+       ↓                                    │
+  Linear projection → 128D                 │
+       └──────────── concat ───────────────┘
+                        ↓
+            Residual MLP (512 hidden)
+                        ↓
+            4D EEF delta action
+```
+
+Train with `--vision` flag:
+
+```bash
+python3 training/train_act.py \
+    --dataset_dir data/datasets/xarm_lift_v1 \
+    --output_dir  data/checkpoints/xarm_lift_v1 \
+    --epochs 200 --vision
+```
+
+The policy node reads `use_vision` from the checkpoint and automatically
+instantiates the correct model — no config change needed.
+
 ---
 
 ### Stage 7 — Safety & Runtime Supervision
@@ -282,6 +328,22 @@ The `watchdog_node` monitors three conditions continuously:
 - Calls `/safety/manual_override` → immediately deactivates policy
 - Re-enables joystick teleop
 - No confirmation required — designed for emergency use
+
+---
+
+## Known Limitations & Future Work
+
+This project demonstrates a complete end-to-end IL pipeline. Known gaps and planned improvements:
+
+**Policy generalisation** — 25 demonstrations is enough to validate the pipeline but real-world robustness requires 100+ episodes covering diverse cube positions. The vision policy (ResNet18 encoder) already helps here by giving the model spatial awareness from the camera.
+
+**Simulation only** — The sim-to-real gap is not addressed. Adapting to a physical xARM6 requires calibrating the action scale, handling camera latency, and domain randomisation during training.
+
+**Action prediction** — The current model predicts a single action per forward pass, repeated for the chunk horizon. True ACT predicts a sequence of T future actions in one shot using a CVAE prior — this would improve temporal consistency over longer horizons.
+
+**No data augmentation** — Adding random crop, colour jitter, and brightness shifts to the image frames during training would improve vision-policy generalisation with the existing 25 demos.
+
+**Checkpoint hot-reload** — After retraining, the policy node requires a Docker restart to load the new weights. A `/policy/reload` service that hot-swaps the checkpoint without restarting would improve the iteration loop.
 
 ---
 

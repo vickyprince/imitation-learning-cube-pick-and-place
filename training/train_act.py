@@ -4,36 +4,38 @@ training/train_act.py
 Trains an ACT (Action Chunking Transformer) policy on demonstrations
 collected via the MYBOTSHOP webserver teleoperation interface.
 
+Two modes
+---------
+State-only  (default):
+    Input  : 32D proprioceptive vector
+    Output : 4D EEF delta command
+
+Vision + State  (--vision flag):
+    Input  : ResNet18(camera image) → 128D features  +  32D state
+    Output : 4D EEF delta command
+
+    The ResNet18 backbone is initialised with ImageNet weights and
+    fine-tuned end-to-end.  Image frames are loaded from the MP4 videos
+    that rosbag2_to_lerobot.py writes alongside the Parquet files.
+
 Observation space: 32D proprioceptive
   EEF pos(3) + quaternion(4) + lin_vel(3) + ang_vel(3) + gripper(1)
   + joint_pos(6) + joint_vel(6) + FT_wrench(6) = 32D
 
-Action space: 4D EEF delta command
-  [dx, dy, dz, gripper]
-
-State channels (STATE_NAMES_32D):
-  ee_x, ee_y, ee_z,
-  ee_qx, ee_qy, ee_qz, ee_qw,
-  ee_vx, ee_vy, ee_vz,
-  ee_wx, ee_wy, ee_wz,
-  gripper,
-  j1, j2, j3, j4, j5, j6,
-  dj1, dj2, dj3, dj4, dj5, dj6,
-  ft_fx, ft_fy, ft_fz, ft_tx, ft_ty, ft_tz
+Action space: 4D EEF delta command  [dx, dy, dz, gripper]
 
 Usage:
+    # State-only (fast, good baseline)
     python3 training/train_act.py \\
-        --dataset_dir /data/datasets/xarm_lift_v1 \\
-        --output_dir  /data/checkpoints/xarm_lift_v1 \\
-        --epochs      100 \\
-        --batch_size  8
+        --dataset_dir data/datasets/xarm_lift_v1 \\
+        --output_dir  data/checkpoints/xarm_lift_v1 \\
+        --epochs 200
 
-The script:
-    1. Loads the LeRobot-format Parquet dataset (32D state columns)
-    2. Builds train/eval splits at the episode level (not frame level)
-    3. Trains ACT with behaviour cloning MSE loss
-    4. Saves best checkpoint to output_dir/act_xarm_lift.pt
-    5. Logs training metrics to stdout (and optionally Weights & Biases)
+    # Vision + state (best accuracy)
+    python3 training/train_act.py \\
+        --dataset_dir data/datasets/xarm_lift_v1 \\
+        --output_dir  data/checkpoints/xarm_lift_v1 \\
+        --epochs 200 --vision
 """
 
 import argparse
@@ -42,6 +44,7 @@ import os
 import pathlib
 import time
 
+import cv2
 import numpy as np
 import pandas as pd
 import torch
@@ -63,22 +66,27 @@ STATE_NAMES_32D = [
 EXPECTED_STATE_DIM  = len(STATE_NAMES_32D)   # 32
 EXPECTED_ACTION_DIM = 4                       # [dx, dy, dz, gripper]
 
+# ImageNet normalisation constants (used for ResNet18 pre-trained weights)
+IMG_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMG_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+IMG_SIZE = 84    # native gym_xarm render resolution — upsampled to 224 for ResNet
+
 
 # ============================================================================
 # Dataset
 # ============================================================================
 class XArmLiftDataset(Dataset):
     """
-    Loads LeRobot Parquet episodes.  Each sample is an (observation, action) pair.
+    Loads LeRobot Parquet episodes.
 
-    observation:
-        state : (32,) float32  — full proprioceptive vector
-        image : not loaded here (state-only training; swap in image encoder for ACT+vision)
-    action:
-        (4,) float32   [dx, dy, dz, gripper]
+    Each sample is (observation, action):
+      observation["state"] : (32,)    float32  proprioceptive vector
+      observation["image"] : (3,224,224) float32  camera frame (vision mode only)
+      action               : (4,)    float32  [dx, dy, dz, gripper]
     """
 
-    def __init__(self, dataset_dir: str, split: str = "train", train_ratio: float = 0.9):
+    def __init__(self, dataset_dir: str, split: str = "train",
+                 train_ratio: float = 0.9, use_vision: bool = False):
         super().__init__()
         parquet_files = sorted(
             pathlib.Path(dataset_dir, "data").glob("**/*.parquet")
@@ -95,33 +103,93 @@ class XArmLiftDataset(Dataset):
         dfs      = [pd.read_parquet(f) for f in files]
         self._df = pd.concat(dfs, ignore_index=True)
 
-        # ---- State columns (32D — prefixed "observation.state.<name>") ----
+        # ---- State columns (32D) ----
         state_cols = [f"observation.state.{n}" for n in STATE_NAMES_32D]
         available  = [c for c in state_cols if c in self._df.columns]
-
         if not available:
-            # Fallback: any column matching "observation.state.*"
             available = sorted(c for c in self._df.columns
                                if c.startswith("observation.state."))
-
         self._states = self._df[available].values.astype(np.float32)
         actual_state_dim = self._states.shape[1]
 
-        # ---- Action columns (4D) ------------------------------------------
-        action_cols = sorted(c for c in self._df.columns if c.startswith("action."))
-        self._actions = self._df[action_cols].values.astype(np.float32)
+        # ---- Action columns (4D) ----
+        action_cols      = sorted(c for c in self._df.columns if c.startswith("action."))
+        self._actions    = self._df[action_cols].values.astype(np.float32)
 
         print(
             f"  [{split}] {len(self._df)} frames, {len(files)} episodes | "
             f"state_dim={actual_state_dim} (expected {EXPECTED_STATE_DIM}), "
             f"action_dim={self._actions.shape[1]}"
         )
-
         if actual_state_dim != EXPECTED_STATE_DIM:
-            print(
-                f"  WARNING: state_dim={actual_state_dim} ≠ {EXPECTED_STATE_DIM}. "
-                "Check that the dataset was recorded with the 32D observation node."
+            print(f"  WARNING: state_dim mismatch — check recording config.")
+
+        # ---- Vision: load video frames ----
+        self._use_vision = use_vision
+        self._frames: list | None = None
+        if use_vision:
+            self._frames = self._load_video_frames(dataset_dir, files)
+
+    def _load_video_frames(self, dataset_dir: str, parquet_files) -> list:
+        """
+        Pre-load all video frames into RAM as (H, W, 3) uint8 numpy arrays.
+
+        At native gym_xarm resolution (84×84) the full dataset fits comfortably
+        in RAM (~500 MB for 25 episodes at 30 Hz).  Frames are converted to
+        RGB and resized to 224×224 during __getitem__ so the DataLoader can
+        do batched GPU preprocessing.
+        """
+        print("  Loading video frames into RAM…")
+        frames = []
+        missing = 0
+
+        for pf in parquet_files:
+            # Parquet filename → episode number (episode_000000.parquet)
+            try:
+                ep_num = int(pf.stem.split("_")[1])
+            except (IndexError, ValueError):
+                ep_num = int(pf.stem.replace("episode_", ""))
+
+            video_path = (
+                pathlib.Path(dataset_dir)
+                / "videos" / "chunk-000"
+                / "observation.images.top"
+                / f"episode_{ep_num:06d}.mp4"
             )
+
+            df_ep   = pd.read_parquet(pf)
+            n_rows  = len(df_ep)
+
+            if video_path.exists():
+                cap       = cv2.VideoCapture(str(video_path))
+                ep_frames = []
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    ep_frames.append(frame)  # BGR uint8
+                cap.release()
+
+                fi_col = df_ep["frame_index"].values if "frame_index" in df_ep.columns \
+                         else np.arange(n_rows)
+                for fi in fi_col:
+                    idx = int(fi)
+                    frames.append(ep_frames[idx] if idx < len(ep_frames)
+                                  else np.zeros((84, 84, 3), dtype=np.uint8))
+            else:
+                missing += 1
+                print(f"  WARNING: video not found — {video_path.name}. "
+                      "Using blank frames for this episode.")
+                frames.extend(
+                    [np.zeros((84, 84, 3), dtype=np.uint8)] * n_rows
+                )
+
+        if missing:
+            print(f"  {missing}/{len(parquet_files)} videos missing. "
+                  "Run bag conversion first to generate MP4s.")
+        print(f"  Loaded {len(frames)} video frames "
+              f"(~{len(frames)*84*84*3//1_000_000} MB raw)")
+        return frames
 
     def __len__(self):
         return len(self._df)
@@ -129,28 +197,27 @@ class XArmLiftDataset(Dataset):
     def __getitem__(self, idx):
         obs    = {"state": torch.from_numpy(self._states[idx])}
         action = torch.from_numpy(self._actions[idx])
+
+        if self._use_vision and self._frames is not None:
+            frame = self._frames[idx]                       # (H, W, 3) BGR uint8
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # → RGB
+            frame = cv2.resize(frame, (224, 224))           # → 224×224 for ResNet18
+            frame = frame.astype(np.float32) / 255.0        # [0, 1]
+            frame = (frame - IMG_MEAN) / IMG_STD            # ImageNet normalise
+            obs["image"] = torch.from_numpy(
+                frame.transpose(2, 0, 1)                    # HWC → CHW (3, 224, 224)
+            )
+
         return obs, action
 
 
 # ============================================================================
-# ACT-like policy network (state-only MLP with residual connections)
-# Replace with full lerobot.policies.act.modeling_act.ACTPolicy for
-# vision-based training (add ResNet18 / ViT image encoder).
+# State-only policy  (fast, good baseline)
 # ============================================================================
 class ACTMiniPolicy(nn.Module):
     """
-    4-layer MLP with residual connections, LayerNorm, and GELU.
+    4-layer MLP with residual connections.
     Maps proprioceptive state (32D) → action (4D).
-
-    For full ACT with vision:
-        - Replace with lerobot.policies.act.modeling_act.ACTPolicy
-        - Add image encoder (ResNet18 or ViT)
-        - Use action chunking (predict T future actions, execute first K)
-
-    Architecture insight (from AIC RunACT.py):
-        - Real Intrinsic robot used ACTPolicy with 26D state + 3 cameras
-        - Our 32D state gives richer signal (velocities + F/T) for contact-rich tasks
-        - F/T channels are especially useful for insertion / peg-in-hole tasks
     """
 
     def __init__(self, state_dim: int = EXPECTED_STATE_DIM,
@@ -162,8 +229,8 @@ class ACTMiniPolicy(nn.Module):
             nn.Linear(hidden, hidden),   nn.LayerNorm(hidden), nn.GELU(),
         )
         self.residual = nn.Sequential(
-            nn.Linear(hidden, hidden),   nn.LayerNorm(hidden), nn.GELU(),
-            nn.Linear(hidden, hidden),   nn.LayerNorm(hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU(),
         )
         self.head = nn.Sequential(
             nn.Linear(hidden, hidden // 2), nn.LayerNorm(hidden // 2), nn.GELU(),
@@ -172,14 +239,81 @@ class ACTMiniPolicy(nn.Module):
 
     def forward(self, state):
         z = self.encoder(state)
-        z = z + self.residual(z)   # residual connection
+        z = z + self.residual(z)
         return self.head(z)
+
+
+# ============================================================================
+# Vision + State policy  (ResNet18 image encoder + state MLP)
+# ============================================================================
+class ACTVisionPolicy(nn.Module):
+    """
+    ResNet18 image encoder fused with proprioceptive state → action.
+
+    Architecture
+    ------------
+    image (3×224×224)  →  ResNet18 backbone  →  Linear(512→img_dim)  →  img_feat
+    state (32D)        ─────────────────────────────────────────────────────────┐
+                                                                                ↓
+                                              concat([img_feat, state]) (img_dim+32)
+                                                                                ↓
+                                                    Residual MLP → head → action (4D)
+
+    The ResNet18 backbone is initialised with ImageNet-pretrained weights.
+    Both the backbone and the head are fine-tuned end-to-end.
+    """
+
+    def __init__(self, state_dim: int = EXPECTED_STATE_DIM,
+                 action_dim: int = EXPECTED_ACTION_DIM,
+                 img_dim: int = 128,
+                 hidden: int = 512):
+        super().__init__()
+        self.img_dim   = img_dim
+        self.state_dim = state_dim
+
+        # ---- Image encoder: ResNet18 with custom projection head ----
+        import torchvision.models as tvm
+        resnet = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
+        # Replace the 1000-class classifier with a projection to img_dim
+        resnet.fc = nn.Sequential(
+            nn.Linear(512, img_dim),
+            nn.LayerNorm(img_dim),
+            nn.GELU(),
+        )
+        self.image_encoder = resnet
+
+        # ---- Fusion MLP: image features + state → action ----
+        fused_dim = img_dim + state_dim
+        self.encoder = nn.Sequential(
+            nn.Linear(fused_dim, hidden), nn.LayerNorm(hidden), nn.GELU(),
+            nn.Linear(hidden, hidden),   nn.LayerNorm(hidden), nn.GELU(),
+        )
+        self.residual = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden // 2), nn.LayerNorm(hidden // 2), nn.GELU(),
+            nn.Linear(hidden // 2, action_dim),
+        )
+
+    def forward(self, state, image):
+        """
+        state : (B, 32)         float32
+        image : (B, 3, 224, 224) float32  ImageNet-normalised
+        """
+        img_feat = self.image_encoder(image)              # (B, img_dim)
+        fused    = torch.cat([img_feat, state], dim=-1)   # (B, img_dim+32)
+        z        = self.encoder(fused)
+        z        = z + self.residual(z)
+        return self.head(z)                               # (B, 4)
 
 
 # ============================================================================
 # Training loop
 # ============================================================================
 def train(args):
+    # ---- Device ----
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -187,46 +321,73 @@ def train(args):
     else:
         device = torch.device("cpu")
     print(f"\nDevice: {device}")
+    print(f"Mode  : {'vision + state' if args.vision else 'state-only'}")
 
     # ---- Dataset ----
     print("\nLoading dataset...")
-    train_ds = XArmLiftDataset(args.dataset_dir, split="train")
-    eval_ds  = XArmLiftDataset(args.dataset_dir, split="eval")
+    train_ds = XArmLiftDataset(args.dataset_dir, split="train",
+                               use_vision=args.vision)
+    eval_ds  = XArmLiftDataset(args.dataset_dir, split="eval",
+                               use_vision=args.vision)
 
-    # num_workers=0: avoids "Too many open files" on macOS (multiprocessing
-    # spawn opens file descriptors per worker; hits ulimit with Parquet files).
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
-    eval_dl  = DataLoader(eval_ds,  batch_size=args.batch_size, shuffle=False, num_workers=0)
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size,
+                          shuffle=True, num_workers=0)
+    eval_dl  = DataLoader(eval_ds,  batch_size=args.batch_size,
+                          shuffle=False, num_workers=0)
 
     state_dim  = train_ds._states.shape[1]
     action_dim = train_ds._actions.shape[1]
 
     # ---- Model ----
-    model    = ACTMiniPolicy(state_dim=state_dim, action_dim=action_dim, hidden=512).to(device)
+    if args.vision:
+        model = ACTVisionPolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            img_dim=args.img_dim,
+            hidden=512,
+        ).to(device)
+    else:
+        model = ACTMiniPolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden=512,
+        ).to(device)
+
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {n_params:,}  (state_dim={state_dim}, action_dim={action_dim})")
+    print(f"Model parameters: {n_params:,}  "
+          f"(state_dim={state_dim}, action_dim={action_dim}"
+          + (f", img_dim={args.img_dim})" if args.vision else ")"))
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs
+    )
     criterion = nn.MSELoss()
 
     # ---- Training ----
     best_eval_loss = float("inf")
     history        = []
 
-    print(f"\nTraining for {args.epochs} epochs (32D state → 4D action)...\n")
+    mode_str = "32D state + ResNet18 image → 4D action" if args.vision \
+               else "32D state → 4D action"
+    print(f"\nTraining for {args.epochs} epochs ({mode_str})...\n")
 
     for epoch in range(1, args.epochs + 1):
         # -- Train --
         model.train()
         train_losses = []
         for obs, action in train_dl:
-            state  = obs["state"].to(device)
             action = action.to(device)
 
-            pred = model(state)
-            loss = criterion(pred, action)
+            if args.vision:
+                state  = obs["state"].to(device)
+                image  = obs["image"].to(device)
+                pred   = model(state, image)
+            else:
+                state  = obs["state"].to(device)
+                pred   = model(state)
 
+            loss = criterion(pred, action)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -238,16 +399,19 @@ def train(args):
         eval_losses = []
         with torch.no_grad():
             for obs, action in eval_dl:
-                state  = obs["state"].to(device)
                 action = action.to(device)
-                pred   = model(state)
+                if args.vision:
+                    pred = model(obs["state"].to(device), obs["image"].to(device))
+                else:
+                    pred = model(obs["state"].to(device))
                 eval_losses.append(criterion(pred, action).item())
 
         scheduler.step()
 
         train_loss = float(np.mean(train_losses))
         eval_loss  = float(np.mean(eval_losses))
-        history.append({"epoch": epoch, "train_loss": train_loss, "eval_loss": eval_loss})
+        history.append({"epoch": epoch, "train_loss": train_loss,
+                        "eval_loss": eval_loss})
 
         if epoch % 10 == 0 or epoch == 1:
             print(
@@ -266,6 +430,8 @@ def train(args):
                 "eval_loss":  eval_loss,
                 "state_dim":  state_dim,
                 "action_dim": action_dim,
+                "use_vision": args.vision,
+                "img_dim":    args.img_dim,
                 "state_names": STATE_NAMES_32D,
             }, ckpt_path)
 
@@ -282,12 +448,18 @@ def train(args):
 # Entry point
 # ============================================================================
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Train ACT policy — state-only or vision+state"
+    )
     parser.add_argument("--dataset_dir", default="/data/datasets/xarm_lift_v1")
     parser.add_argument("--output_dir",  default="/data/checkpoints/xarm_lift_v1")
     parser.add_argument("--epochs",      type=int,   default=100)
     parser.add_argument("--batch_size",  type=int,   default=8)
     parser.add_argument("--lr",          type=float, default=1e-4)
+    parser.add_argument("--vision",      action="store_true",
+                        help="Use ResNet18 camera encoder alongside state")
+    parser.add_argument("--img_dim",     type=int,   default=128,
+                        help="Image feature dimension from ResNet18 projection head")
     args = parser.parse_args()
     train(args)
 

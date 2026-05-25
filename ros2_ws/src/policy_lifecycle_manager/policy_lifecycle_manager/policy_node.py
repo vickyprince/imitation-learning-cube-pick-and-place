@@ -73,9 +73,50 @@ try:
             z = z + self.residual(z)
             return self.head(z)
 
+    class ACTVisionPolicy(nn.Module):
+        """
+        ResNet18 image encoder fused with proprioceptive state → action.
+        Must exactly mirror training/train_act.py:ACTVisionPolicy.
+        """
+        def __init__(self, state_dim: int = 32, action_dim: int = 4,
+                     img_dim: int = 128, hidden: int = 512):
+            super().__init__()
+            import torchvision.models as tvm
+            resnet    = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
+            resnet.fc = nn.Sequential(
+                nn.Linear(512, img_dim),
+                nn.LayerNorm(img_dim),
+                nn.GELU(),
+            )
+            self.image_encoder = resnet
+            fused_dim = img_dim + state_dim
+            self.encoder = nn.Sequential(
+                nn.Linear(fused_dim, hidden), nn.LayerNorm(hidden), nn.GELU(),
+                nn.Linear(hidden, hidden),   nn.LayerNorm(hidden), nn.GELU(),
+            )
+            self.residual = nn.Sequential(
+                nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU(),
+                nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU(),
+            )
+            self.head = nn.Sequential(
+                nn.Linear(hidden, hidden // 2), nn.LayerNorm(hidden // 2), nn.GELU(),
+                nn.Linear(hidden // 2, action_dim),
+            )
+
+        def forward(self, state, image):
+            img_feat = self.image_encoder(image)
+            fused    = torch.cat([img_feat, state], dim=-1)
+            z        = self.encoder(fused)
+            z        = z + self.residual(z)
+            return self.head(z)
+
     _TORCH_AVAILABLE = True
 except ImportError:
     _TORCH_AVAILABLE = False
+
+# ImageNet normalisation for ResNet18 vision encoder
+_IMG_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+_IMG_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
 
 
 class PolicyLifecycleManager(LifecycleNode):
@@ -296,7 +337,10 @@ class PolicyLifecycleManager(LifecycleNode):
 
     def _load_policy(self, ckpt_path: str):
         """
-        Load ACTMiniPolicy from a checkpoint saved by training/train_act.py.
+        Load policy from checkpoint saved by training/train_act.py.
+
+        Auto-detects whether the checkpoint is state-only (ACTMiniPolicy)
+        or vision+state (ACTVisionPolicy) via the 'use_vision' key.
         Falls back to random policy if checkpoint not found (demo mode).
         """
         import os
@@ -312,43 +356,75 @@ class PolicyLifecycleManager(LifecycleNode):
 
         try:
             import torch
-            ckpt = torch.load(ckpt_path, map_location="cpu")
+            ckpt       = torch.load(ckpt_path, map_location="cpu")
             state_dim  = ckpt.get("state_dim",  32)
             action_dim = ckpt.get("action_dim",  4)
-            policy = ACTMiniPolicy(state_dim=state_dim, action_dim=action_dim, hidden=512)
+            use_vision = ckpt.get("use_vision", False)
+            img_dim    = ckpt.get("img_dim",    128)
+
+            if use_vision:
+                policy = ACTVisionPolicy(
+                    state_dim=state_dim, action_dim=action_dim,
+                    img_dim=img_dim, hidden=512
+                )
+            else:
+                policy = ACTMiniPolicy(
+                    state_dim=state_dim, action_dim=action_dim, hidden=512
+                )
+
             policy.load_state_dict(ckpt["state_dict"])
             policy.eval()
+
+            mode_str = f"vision+state (img_dim={img_dim})" if use_vision else "state-only"
             self.get_logger().info(
-                f"ACTMiniPolicy loaded — state_dim={state_dim}, "
-                f"action_dim={action_dim}, eval_loss={ckpt.get('eval_loss', '?'):.5f}"
+                f"Policy loaded [{mode_str}] — "
+                f"state_dim={state_dim}, action_dim={action_dim}, "
+                f"eval_loss={ckpt.get('eval_loss', float('nan')):.5f}"
             )
-            # Store dims for obs building
+
             self._state_dim  = state_dim
             self._action_dim = action_dim
+            self._use_vision = use_vision
             return policy
+
         except Exception as e:
             self.get_logger().warn(f"Could not load checkpoint: {e}. Using random policy.")
             return None
 
     def _build_obs(self, image: np.ndarray, joints: list) -> dict:
         """
-        Package the full 32D proprioceptive state into a tensor.
-        joints is the full list from /sim/joint_states position field (32 values).
+        Build observation dict for the policy.
+
+        State-only : {"state": (1, 32)}
+        Vision     : {"state": (1, 32), "image": (1, 3, 224, 224)}
         """
         import torch
         state_dim = getattr(self, "_state_dim", 32)
-        # Pad or truncate to state_dim
-        state = joints[:state_dim]
+        state     = joints[:state_dim]
         if len(state) < state_dim:
             state = state + [0.0] * (state_dim - len(state))
         state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)  # (1, 32)
-        return {"observation.state": state_t}
+        obs = {"state": state_t}
+
+        if getattr(self, "_use_vision", False) and image is not None:
+            # BGR (OpenCV) → RGB → resize → normalise → CHW tensor
+            img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img, (224, 224))
+            img = img.astype(np.float32) / 255.0
+            img = (img - _IMG_MEAN.reshape(1, 1, 3)) / _IMG_STD.reshape(1, 1, 3)
+            img_t = torch.from_numpy(
+                img.transpose(2, 0, 1)  # HWC → CHW
+            ).unsqueeze(0)             # (1, 3, 224, 224)
+            obs["image"] = img_t
+
+        return obs
 
     def _predict(self, obs: dict, horizon: int) -> list:
         """
-        Run ACTMiniPolicy inference and return a list of `horizon` identical
-        actions (state-only MLP predicts one action per forward pass; we
-        repeat it for the full chunk so the action-chunking buffer works).
+        Run inference and return a list of `horizon` actions.
+
+        The same action is repeated for the full chunk — the policy
+        re-queries every `horizon` steps (action chunking).
         """
         if self._policy is None:
             self._confidence = 0.0
@@ -359,17 +435,16 @@ class PolicyLifecycleManager(LifecycleNode):
 
         import torch
         with torch.no_grad():
-            action = self._policy(obs["observation.state"])   # (1, 4)
+            if getattr(self, "_use_vision", False) and "image" in obs:
+                action = self._policy(obs["state"], obs["image"])   # (1, 4)
+            else:
+                action = self._policy(obs["state"])                 # (1, 4)
 
         action_np = action.squeeze(0).cpu().numpy()   # (4,)
-
-        # Clamp XYZ deltas to SENSITIVITY range used during teleoperation (±0.4).
-        # Gripper stays in full [-1, 1] range.
         action_np[:3] = np.clip(action_np[:3], -0.4, 0.4)
         action_np[3]  = np.clip(action_np[3],  -1.0, 1.0)
 
         self._confidence = float(np.abs(action_np).mean())
-        # Repeat for full chunk — policy re-predicts every `horizon` steps
         return [action_np.tolist() for _ in range(horizon)]
 
     def _publish_command(self, action: list):

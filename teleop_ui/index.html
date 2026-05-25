@@ -359,6 +359,10 @@
         <div class="label">Confidence</div>
         <div class="value" id="policy-conf">—</div>
       </div>
+      <div class="metric-pill">
+        <div class="label">Success Rate</div>
+        <div class="value" id="policy-success" style="color:var(--green)">0 / 0</div>
+      </div>
     </div>
   </div>
 
@@ -755,9 +759,15 @@ function setupSubscribers() {
     document.getElementById('policy-conf').textContent = m.data.toFixed(3);
   });
 
-  // Task completion — show toast and auto-return to teleop mode
+  // Task completion — update success counter, show toast, auto-return to teleop
   sub('/sim/task_complete', 'std_msgs/Bool', (m) => {
     if (m.data) {
+      // Only count if policy was active (not teleop manual success)
+      if (_trainingStatus !== 'running' && policyState === 'active') {
+        _policyAttempts++;
+        _policySuccesses++;
+        _updateSuccessDisplay();
+      }
       const toast = document.getElementById('task-toast');
       toast.style.display = 'block';
       setMode('teleop');
@@ -832,6 +842,25 @@ function discardEpisode() {
 // Policy lifecycle — ROS2 managed lifecycle via rosbridge
 // Transition IDs: CONFIGURE=1, CLEANUP=2, ACTIVATE=3, DEACTIVATE=4
 // ============================================================================
+
+// Success rate tracking — reset on page reload, persists across Run/Stop cycles
+let _policyAttempts  = 0;
+let _policySuccesses = 0;
+
+function _updateSuccessDisplay() {
+  const el  = document.getElementById('policy-success');
+  if (!el) return;
+  const pct = _policyAttempts > 0
+    ? ` (${Math.round(_policySuccesses / _policyAttempts * 100)}%)`
+    : '';
+  el.textContent = `${_policySuccesses} / ${_policyAttempts}${pct}`;
+  el.style.color = _policyAttempts === 0 ? 'var(--muted)'
+    : _policySuccesses / _policyAttempts >= 0.6 ? 'var(--green)' : 'var(--yellow)';
+}
+
+function resetSuccessCounter() {
+  _policyAttempts = 0; _policySuccesses = 0; _updateSuccessDisplay();
+}
 let policyState = 'unconfigured';  // unconfigured | configured | active | inactive
 
 function lifecycleTransition(transitionId, label, onSuccess) {
@@ -858,6 +887,9 @@ function lifecycleTransition(transitionId, label, onSuccess) {
 function runPolicy() {
   if (!ros) return;
   log('Policy: starting…');
+  // Each Run Policy click = one attempt
+  _policyAttempts++;
+  _updateSuccessDisplay();
   const svc = new ROSLIB.Service({ ros, name: '/policy/run', serviceType: 'std_srvs/Trigger' });
   svc.callService(new ROSLIB.ServiceRequest({}), (r) => {
     if (r && r.success) {
