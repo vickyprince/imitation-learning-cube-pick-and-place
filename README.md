@@ -14,6 +14,11 @@ integrated end-to-end with a browser-based teleoperation UI.**
 
 ## Pipeline Overview
 
+
+<video src="https://github.com/user-attachments/assets/40d00337-25f4-41e1-b3c5-dd2ddf4488a7" autoplay loop muted playsinline width="100%"></video>
+
+
+
 ```
 Browser UI (http://localhost:9000)
   ├── Camera feed         ← /sim/camera/image_compressed
