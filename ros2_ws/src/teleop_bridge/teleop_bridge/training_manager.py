@@ -47,8 +47,8 @@ CONVERT_SCRIPT = "/ros2_ws/install/dataset_pipeline/lib/dataset_pipeline/rosbag2
 
 DEFAULT_CONFIG = {
     "bags_dir":     "/data/bags",
-    "dataset_dir":  "/data/datasets/xarm_lift_v1",
-    "output_dir":   "/data/checkpoints/xarm_lift_v1",
+    "dataset_dir":  "/data/datasets/xarm_lift_v2_fresh",
+    "output_dir":   "/data/checkpoints/xarm_lift_v2",
     "task_name":    "xarm_lift",
     "auto_convert": True,
     "epochs":       2,

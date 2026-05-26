@@ -39,6 +39,7 @@ class RecordingManager(Node):
         self.declare_parameter("bag_output_dir", "/data/bags")
         self.declare_parameter("topics", [
             "/sim/camera/image_compressed",
+            "/sim/camera/wrist/image_compressed",  # wrist camera for grasp alignment
             "/sim/joint_states",       # 32D state vector
             "/sim/ee_pose",            # EEF pose (PoseStamped)
             "/sim/wrench",             # F/T wrench (WrenchStamped)

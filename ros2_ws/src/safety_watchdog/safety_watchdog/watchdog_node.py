@@ -149,12 +149,13 @@ class SafetyWatchdog(Node):
         self.create_subscription(WrenchStamped, "/sim/wrench",           self._cb_wrench,     10)
 
         # ------------------------------------------------------------------ #
-        # Lifecycle client for policy_node
+        # Policy control clients — use the same Trigger services as the UI.
+        # This avoids touching the lifecycle state machine, which would fail
+        # because _srv_run bypasses it (calls on_activate directly).
         # ------------------------------------------------------------------ #
-        self._policy_lifecycle_cli = self.create_client(
-            ChangeState, "/policy_node/change_state"
-        )
-        self._teleop_cli = self.create_client(SetBool, "/teleop/enable")
+        self._policy_stop_cli = self.create_client(Trigger, "/policy/stop")
+        self._policy_run_cli  = self.create_client(Trigger, "/policy/run")
+        self._teleop_cli      = self.create_client(SetBool, "/teleop/enable")
 
         # ------------------------------------------------------------------ #
         # Services
@@ -289,15 +290,12 @@ class SafetyWatchdog(Node):
         return resp
 
     def _srv_resume_policy(self, _req, resp):
-        if not self._policy_lifecycle_cli.service_is_ready():
+        if not self._policy_run_cli.service_is_ready():
             resp.success = False
-            resp.message = "Policy lifecycle service not available."
+            resp.message = "Policy /policy/run service not available."
             return resp
 
-        req = ChangeState.Request()
-        req.transition.id = Transition.TRANSITION_ACTIVATE
-        self._policy_lifecycle_cli.call_async(req)
-
+        self._policy_run_cli.call_async(Trigger.Request())
         self._set_teleop(False)
         self._safety_state = "ok"
         self.get_logger().info("Policy resumed after manual inspection.")
@@ -313,10 +311,10 @@ class SafetyWatchdog(Node):
         self._safety_state = "emergency"
         self._pub_alert.publish(String(data=reason))
 
-        if self._policy_lifecycle_cli.service_is_ready():
-            req = ChangeState.Request()
-            req.transition.id = Transition.TRANSITION_DEACTIVATE
-            self._policy_lifecycle_cli.call_async(req)
+        # Call /policy/stop (same Trigger service the UI uses) — avoids the
+        # lifecycle state machine which would throw if the node state is stale.
+        if self._policy_stop_cli.service_is_ready():
+            self._policy_stop_cli.call_async(Trigger.Request())
 
         self._set_teleop(True)
         self._conf_warn_count = 0

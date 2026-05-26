@@ -1,7 +1,7 @@
 """
 policy_lifecycle_manager/policy_node.py
 ========================================
-ROS2 Lifecycle Node that loads an ACT checkpoint and runs inference.
+ROS2 Lifecycle Node — loads a LeRobot ACT checkpoint and runs inference.
 
 Lifecycle states
 ----------------
@@ -11,22 +11,23 @@ Lifecycle states
   deactivated   Inference paused. Falls back to teleop.
   shutdown      Clean teardown.
 
-The MYBOTSHOP webserver action buttons call ROS2 lifecycle transitions:
-  "Configure Policy"   → ros2 lifecycle set /policy_node configure
-  "Activate Policy"    → ros2 lifecycle set /policy_node activate
-  "Deactivate Policy"  → ros2 lifecycle set /policy_node deactivate
+Browser UI buttons call Trigger services (avoids lifecycle_msgs/ChangeState
+which rosbridge cannot resolve):
+  "Run Policy"  → /policy/run   (configure if needed, then activate)
+  "Stop Policy" → /policy/stop  (deactivate)
 
 Published topics
 ----------------
 /sim/joint_command        sensor_msgs/JointState      inference output
 /policy/status            std_msgs/String             state label
 /policy/inference_fps     std_msgs/Float32            rolling avg FPS
-/policy/confidence        std_msgs/Float32            action confidence score
+/policy/confidence        std_msgs/Float32            mean |action| score
 
 Subscribed topics
 -----------------
-/sim/camera/image_compressed  sensor_msgs/CompressedImage  visual observation
-/sim/joint_states             sensor_msgs/JointState       proprioceptive obs
+/sim/camera/image_compressed        sensor_msgs/CompressedImage  top camera
+/sim/camera/wrist/image_compressed  sensor_msgs/CompressedImage  wrist camera
+/sim/joint_states                   sensor_msgs/JointState       32D proprioception
 """
 
 import time
@@ -43,161 +44,240 @@ from sensor_msgs.msg import CompressedImage, JointState
 from std_msgs.msg import Float32, String
 from std_srvs.srv import Trigger
 
-# ---------------------------------------------------------------------------
-# ACTMiniPolicy — must match training/train_act.py exactly
-# (copied here so the inference container doesn't need the training package)
-# ---------------------------------------------------------------------------
 try:
     import torch
     import torch.nn as nn
-
-    class ACTMiniPolicy(nn.Module):
-        """4-layer MLP with residual connections. Maps 32D state → 4D action."""
-        def __init__(self, state_dim: int = 32, action_dim: int = 4, hidden: int = 512):
-            super().__init__()
-            self.encoder = nn.Sequential(
-                nn.Linear(state_dim, hidden), nn.LayerNorm(hidden), nn.GELU(),
-                nn.Linear(hidden, hidden),   nn.LayerNorm(hidden), nn.GELU(),
-            )
-            self.residual = nn.Sequential(
-                nn.Linear(hidden, hidden),   nn.LayerNorm(hidden), nn.GELU(),
-                nn.Linear(hidden, hidden),   nn.LayerNorm(hidden), nn.GELU(),
-            )
-            self.head = nn.Sequential(
-                nn.Linear(hidden, hidden // 2), nn.LayerNorm(hidden // 2), nn.GELU(),
-                nn.Linear(hidden // 2, action_dim),
-            )
-
-        def forward(self, state):
-            z = self.encoder(state)
-            z = z + self.residual(z)
-            return self.head(z)
-
-    class ACTVisionPolicy(nn.Module):
-        """
-        ResNet18 image encoder fused with proprioceptive state → action.
-        Must exactly mirror training/train_act.py:ACTVisionPolicy.
-        """
-        def __init__(self, state_dim: int = 32, action_dim: int = 4,
-                     img_dim: int = 128, hidden: int = 512):
-            super().__init__()
-            import torchvision.models as tvm
-            resnet    = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
-            resnet.fc = nn.Sequential(
-                nn.Linear(512, img_dim),
-                nn.LayerNorm(img_dim),
-                nn.GELU(),
-            )
-            self.image_encoder = resnet
-            fused_dim = img_dim + state_dim
-            self.encoder = nn.Sequential(
-                nn.Linear(fused_dim, hidden), nn.LayerNorm(hidden), nn.GELU(),
-                nn.Linear(hidden, hidden),   nn.LayerNorm(hidden), nn.GELU(),
-            )
-            self.residual = nn.Sequential(
-                nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU(),
-                nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU(),
-            )
-            self.head = nn.Sequential(
-                nn.Linear(hidden, hidden // 2), nn.LayerNorm(hidden // 2), nn.GELU(),
-                nn.Linear(hidden // 2, action_dim),
-            )
-
-        def forward(self, state, image):
-            img_feat = self.image_encoder(image)
-            fused    = torch.cat([img_feat, state], dim=-1)
-            z        = self.encoder(fused)
-            z        = z + self.residual(z)
-            return self.head(z)
-
     _TORCH_AVAILABLE = True
 except ImportError:
     _TORCH_AVAILABLE = False
 
-# ImageNet normalisation for ResNet18 vision encoder
-_IMG_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
-_IMG_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+# ImageNet normalisation constants (match train_act.py)
+_IMG_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMG_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Local checkpoint model classes — mirror of train_act.py
+# (used when checkpoint_path points to a .pt file, not a LeRobot directory)
+# ---------------------------------------------------------------------------
+
+class _ACTMiniPolicy(nn.Module):
+    """4-layer MLP: proprioceptive state (32D) → action (4D)."""
+
+    def __init__(self, state_dim: int = 32, action_dim: int = 4, hidden: int = 512):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden), nn.LayerNorm(hidden), nn.GELU(),
+            nn.Linear(hidden, hidden),   nn.LayerNorm(hidden), nn.GELU(),
+        )
+        self.residual = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden // 2), nn.LayerNorm(hidden // 2), nn.GELU(),
+            nn.Linear(hidden // 2, action_dim),
+        )
+
+    def forward(self, state):
+        z = self.encoder(state)
+        z = z + self.residual(z)
+        return self.head(z)
+
+
+class _ACTVisionPolicy(nn.Module):
+    """ResNet18 image encoder + proprioceptive state → action (4D)."""
+
+    def __init__(self, state_dim: int = 32, action_dim: int = 4,
+                 img_dim: int = 128, hidden: int = 512):
+        super().__init__()
+        self.img_dim = img_dim
+        import torchvision.models as tvm
+        resnet = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
+        resnet.fc = nn.Sequential(
+            nn.Linear(512, img_dim), nn.LayerNorm(img_dim), nn.GELU(),
+        )
+        self.image_encoder = resnet
+        fused_dim = img_dim + state_dim
+        self.encoder = nn.Sequential(
+            nn.Linear(fused_dim, hidden), nn.LayerNorm(hidden), nn.GELU(),
+            nn.Linear(hidden, hidden),   nn.LayerNorm(hidden), nn.GELU(),
+        )
+        self.residual = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden // 2), nn.LayerNorm(hidden // 2), nn.GELU(),
+            nn.Linear(hidden // 2, action_dim),
+        )
+
+    def forward(self, state, image):
+        img_feat = self.image_encoder(image)
+        fused    = torch.cat([img_feat, state], dim=-1)
+        z        = self.encoder(fused)
+        z        = z + self.residual(z)
+        return self.head(z)
+
+
+class _LocalACTWrapper:
+    """
+    Wraps a locally-trained .pt checkpoint (train_act.py output) with the
+    same select_action() / reset() interface used by LeRobot ACTPolicy,
+    so the rest of policy_node.py needs no changes.
+
+    obs dict keys consumed:
+      "observation.state"      : (1, 32)  float32 tensor
+      "observation.images.top" : (1, 3, H, W) float32 tensor  (vision mode only)
+    """
+
+    def __init__(self, model, device, use_vision: bool):
+        self._model      = model
+        self._device     = device
+        self._use_vision = use_vision
+
+    def reset(self):
+        pass  # no action queue to clear
+
+    def select_action(self, obs: dict):
+        state = obs["observation.state"].to(self._device)   # (1, 32)
+        with torch.no_grad():
+            if self._use_vision:
+                img = obs["observation.images.top"].to(self._device)  # (1,3,H,W)
+                # Resize to 112×112 and ImageNet-normalise to match training
+                B, C, H, W = img.shape
+                if H != 112 or W != 112:
+                    # Use bilinear interpolate via torch (no OpenCV dep here)
+                    img = torch.nn.functional.interpolate(
+                        img, size=(112, 112), mode="bilinear", align_corners=False
+                    )
+                mean = torch.tensor(_IMG_MEAN, device=self._device).view(1, 3, 1, 1)
+                std  = torch.tensor(_IMG_STD,  device=self._device).view(1, 3, 1, 1)
+                img  = (img - mean) / std
+                action = self._model(state, img)   # (1, 4)
+            else:
+                action = self._model(state)        # (1, 4)
+        return action.squeeze(0)  # (4,)
 
 
 class PolicyLifecycleManager(LifecycleNode):
     """
-    ACT policy inference node following the ROS2 managed lifecycle.
-    On configure: loads checkpoint from /data/checkpoints/act_xarm_lift.pt
-    On activate:  starts inference loop at ~30 Hz
+    LeRobot ACTPolicy inference node following the ROS2 managed lifecycle.
+
+    Checkpoint: /data/lerobot_checkpoints/xarm_act_<job_id>/
+      Produced by lerobot-train on the H-BRS cluster.
+      Supports single-camera (observation.images.top) and dual-camera
+      (observation.images.top + observation.images.wrist) checkpoints.
+      The presence of "observation.images.wrist" in config.json is
+      detected automatically at load time.
+
+    Action chunking is handled internally by LeRobot's select_action()
+    via _action_queue (n_action_steps from config). Call once per step.
     """
+
+    # Top camera trained resolution (policy config: shape [3, 480, 640])
+    TOP_H, TOP_W       = 480, 640
+    # Wrist camera trained resolution (policy config: shape [3, 128, 128])
+    WRIST_H, WRIST_W   = 128, 128
 
     def __init__(self):
         super().__init__("policy_node")
 
-        self.declare_parameter("checkpoint_path", "/data/checkpoints/xarm_lift_v1/act_xarm_lift.pt")
-        self.declare_parameter("inference_fps",   30.0)
-        self.declare_parameter("action_horizon",  8)    # ACT chunking horizon
-        self.declare_parameter("confidence_threshold", 0.3)
+        self.declare_parameter(
+            "checkpoint_path", "/data/checkpoints/xarm_lift_v2/act_xarm_lift.pt"
+        )
+        self.declare_parameter("inference_fps",          30.0)
+        self.declare_parameter("confidence_threshold",   0.02)
 
-        self._policy    = None
-        self._device    = "cpu"   # M1 via Docker: use CPU (MPS not available in container)
-        self._lock      = threading.Lock()
+        self._policy     = None
+        self._use_wrist  = False   # set True when checkpoint has wrist camera
+        self._running    = False
+        self._lock       = threading.Lock()
 
-        # Rolling observations (latest)
-        self._latest_image  = None
-        self._latest_joints = None
-
-        # Action chunk buffer (ACT predicts a horizon of actions at once)
-        self._action_chunk: list = []
-        self._chunk_idx = 0
+        # Latest observations
+        self._latest_image       = None   # top camera (BGR, any resolution)
+        self._latest_wrist_image = None   # wrist camera (BGR, 128×128 from sim)
+        self._latest_joints      = None   # 32D state vector
 
         # Metrics
         self._fps_window = collections.deque(maxlen=30)
         self._confidence = 0.0
 
-        # Simple Trigger services for browser UI (avoids lifecycle_msgs/ChangeState
-        # which rosbridge can't resolve without extra type introspection).
-        # /policy/run  → configure (if needed) + activate
-        # /policy/stop → deactivate
+        # Trigger services for browser UI
         self.create_service(Trigger, "/policy/run",  self._srv_run)
         self.create_service(Trigger, "/policy/stop", self._srv_stop)
+
+        # Pre-load 2 s after startup so "Run Policy" click is instant
+        self._pre_configure_done = False
+        self.create_timer(2.0, self._pre_configure_once)
 
         self.get_logger().info("PolicyLifecycleManager created — awaiting configure.")
 
     # ================================================================== #
-    # Lifecycle callbacks
+    # Startup pre-load
     # ================================================================== #
-    def on_configure(self, state: State) -> TransitionCallbackReturn:
-        self.get_logger().info("Configuring: loading ACT checkpoint…")
-
-        ckpt = self.get_parameter("checkpoint_path").value
+    def _pre_configure_once(self):
+        if self._pre_configure_done:
+            return
+        self._pre_configure_done = True
         try:
-            self._policy = self._load_policy(ckpt)
-            self.get_logger().info(f"Checkpoint loaded: {ckpt}")
+            ckpt = self.get_parameter("checkpoint_path").value
+            self._policy    = self._load_policy(ckpt)
+            self._setup_pubsub()
+            self.get_logger().info("Policy pre-loaded — Run Policy click will be instant.")
         except Exception as e:
-            self.get_logger().error(f"Failed to load checkpoint: {e}")
-            return TransitionCallbackReturn.FAILURE
+            self.get_logger().warn(f"Pre-configure failed: {e}")
 
-        # Publishers (created on configure, not in __init__)
-        self._pub_cmd   = self.create_publisher(JointState,  "/sim/joint_command",    10)
-        self._pub_stat  = self.create_publisher(String,      "/policy/status",         1)
-        self._pub_fps   = self.create_publisher(Float32,     "/policy/inference_fps",  10)
-        self._pub_conf  = self.create_publisher(Float32,     "/policy/confidence",     10)
+    def _setup_pubsub(self):
+        """Create publishers and subscribers (idempotent)."""
+        if hasattr(self, "_pub_cmd"):
+            return  # already done
+        self._pub_cmd  = self.create_publisher(JointState, "/sim/joint_command",    10)
+        self._pub_stat = self.create_publisher(String,     "/policy/status",         1)
+        self._pub_fps  = self.create_publisher(Float32,    "/policy/inference_fps",  10)
+        self._pub_conf = self.create_publisher(Float32,    "/policy/confidence",     10)
 
-        # Subscribers
         self._sub_img = self.create_subscription(
-            CompressedImage, "/sim/camera/image_compressed", self._cb_image, 10
+            CompressedImage, "/sim/camera/image_compressed",
+            self._cb_image, 10
+        )
+        self._sub_wrist = self.create_subscription(
+            CompressedImage, "/sim/camera/wrist/image_compressed",
+            self._cb_wrist_image, 10
         )
         self._sub_js = self.create_subscription(
             JointState, "/sim/joint_states", self._cb_joints, 10
         )
 
+    # ================================================================== #
+    # Lifecycle callbacks
+    # ================================================================== #
+    def on_configure(self, state: State) -> TransitionCallbackReturn:
+        if self._pre_configure_done and self._policy is not None:
+            self.get_logger().info("Already pre-loaded — skipping configure.")
+            self._publish_status("configured")
+            return TransitionCallbackReturn.SUCCESS
+
+        self.get_logger().info("Configuring: loading LeRobot ACT checkpoint…")
+        ckpt = self.get_parameter("checkpoint_path").value
+        try:
+            self._policy = self._load_policy(ckpt)
+        except Exception as e:
+            self.get_logger().error(f"Failed to load checkpoint: {e}")
+            return TransitionCallbackReturn.FAILURE
+
+        self._setup_pubsub()
         self._publish_status("configured")
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state: State) -> TransitionCallbackReturn:
         self.get_logger().info("Activating: starting inference loop.")
-        # Clear any stale observations and action chunks from a previous run
-        self._action_chunk = []
-        self._chunk_idx    = 0
         with self._lock:
-            self._latest_image  = None
-            self._latest_joints = None
+            self._latest_image       = None
+            self._latest_wrist_image = None
+            self._latest_joints      = None
+        if self._policy is not None and hasattr(self._policy, "reset"):
+            self._policy.reset()
         self._running = True
         self._inference_thread = threading.Thread(
             target=self._inference_loop, daemon=True
@@ -207,7 +287,7 @@ class PolicyLifecycleManager(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state: State) -> TransitionCallbackReturn:
-        self.get_logger().info("Deactivating: stopping inference, restoring teleop.")
+        self.get_logger().info("Deactivating: stopping inference.")
         self._running = False
         if hasattr(self, "_inference_thread"):
             self._inference_thread.join(timeout=2.0)
@@ -221,59 +301,74 @@ class PolicyLifecycleManager(LifecycleNode):
 
     def on_shutdown(self, state: State) -> TransitionCallbackReturn:
         self._running = False
-        self.get_logger().info("PolicyLifecycleManager shutting down.")
         return TransitionCallbackReturn.SUCCESS
 
     # ================================================================== #
     # Observation callbacks
     # ================================================================== #
     def _cb_image(self, msg: CompressedImage):
-        buf = np.frombuffer(msg.data, dtype=np.uint8)
+        buf   = np.frombuffer(msg.data, dtype=np.uint8)
         frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if frame is not None:
             with self._lock:
                 self._latest_image = frame
+
+    def _cb_wrist_image(self, msg: CompressedImage):
+        buf   = np.frombuffer(msg.data, dtype=np.uint8)
+        frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if frame is not None:
+            with self._lock:
+                self._latest_wrist_image = frame
 
     def _cb_joints(self, msg: JointState):
         with self._lock:
             self._latest_joints = list(msg.position)
 
     # ================================================================== #
-    # Inference loop (runs in background thread while active)
+    # Inference loop
     # ================================================================== #
     def _inference_loop(self):
         fps_target = self.get_parameter("inference_fps").value
-        dt = 1.0 / fps_target
-        horizon = self.get_parameter("action_horizon").value
+        dt   = 1.0 / fps_target
+        step = 0
 
         while self._running:
             t0 = time.time()
 
             with self._lock:
-                image  = self._latest_image.copy()  if self._latest_image  is not None else None
-                joints = list(self._latest_joints)  if self._latest_joints is not None else None
+                image       = self._latest_image.copy()       if self._latest_image       is not None else None
+                wrist_image = self._latest_wrist_image.copy() if self._latest_wrist_image is not None else None
+                joints      = list(self._latest_joints)       if self._latest_joints      is not None else None
 
+            # Wait until we have top camera + joints.
+            # Wrist camera is optional: if checkpoint was trained without it,
+            # _use_wrist is False and wrist_image is ignored.
             if image is None or joints is None:
                 time.sleep(dt)
                 continue
+            if self._use_wrist and wrist_image is None:
+                time.sleep(dt)
+                continue
 
-            # -- Action chunking: re-predict every 'horizon' steps --------- #
-            if self._chunk_idx >= len(self._action_chunk):
-                obs = self._build_obs(image, joints)
-                self._action_chunk = self._predict(obs, horizon)
-                self._chunk_idx = 0
-
-            action = self._action_chunk[self._chunk_idx]
-            self._chunk_idx += 1
-
+            obs    = self._build_obs(image, wrist_image, joints)
+            action = self._predict(obs)
             self._publish_command(action)
 
-            # -- Metrics --------------------------------------------------- #
+            # Debug log every 30 steps
+            step += 1
+            if step % 30 == 1:
+                j = joints[:32]
+                self.get_logger().info(
+                    f"[step {step}] EEF ({j[0]:.3f},{j[1]:.3f},{j[2]:.3f}) "
+                    f"grip={j[13]:.3f} | "
+                    f"act dx={action[0]:.4f} dy={action[1]:.4f} "
+                    f"dz={action[2]:.4f} g={action[3]:.4f} "
+                    f"conf={self._confidence:.3f}"
+                )
+
             elapsed = time.time() - t0
             self._fps_window.append(1.0 / max(elapsed, 1e-6))
-            avg_fps = float(np.mean(self._fps_window))
-
-            self._pub_fps.publish(Float32(data=avg_fps))
+            self._pub_fps.publish(Float32(data=float(np.mean(self._fps_window))))
             self._pub_conf.publish(Float32(data=float(self._confidence)))
 
             sleep_t = dt - elapsed
@@ -281,51 +376,33 @@ class PolicyLifecycleManager(LifecycleNode):
                 time.sleep(sleep_t)
 
     # ================================================================== #
-    # Model helpers
+    # Trigger service handlers (browser UI)
     # ================================================================== #
-    # ================================================================== #
-    # Simple browser-facing Trigger services
-    # ================================================================== #
-    def _srv_run(self, _request, response):
-        """
-        /policy/run — called by 'Run Policy' button in the webserver UI.
-
-        Always does a clean restart:
-          1. Stop the current inference thread if running (deactivate).
-          2. Load the checkpoint if not already loaded (configure).
-          3. Reset action chunk and start a fresh inference thread (activate).
-
-        This means clicking Run Policy a second time after Reset Env always
-        works correctly, without needing to rebuild Docker.
-        """
+    def _srv_run(self, _req, response):
+        """/policy/run — always does a clean restart."""
         try:
-            # Step 1: stop any running inference thread first
             if self._running:
-                self.get_logger().info("Re-run requested — deactivating current session.")
                 self.on_deactivate(None)
 
-            # Step 2: load checkpoint (only once per container lifetime)
-            if not hasattr(self, '_policy') or self._policy is None:
+            if self._policy is None:
                 result = self.on_configure(None)
                 if result != TransitionCallbackReturn.SUCCESS:
                     response.success = False
                     response.message = "Configure failed — check checkpoint path."
                     return response
 
-            # Step 3: fresh activate — resets action chunk, starts new thread
             self.on_activate(None)
+            cam_str = "top+wrist" if self._use_wrist else "top-only"
             response.success = True
-            response.message = "Policy active — ACT inference running."
-
+            response.message = f"ACT inference active ({cam_str})."
         except Exception as e:
             self._running = False
             response.success = False
             response.message = f"Policy run error: {e}"
-
         return response
 
-    def _srv_stop(self, _request, response):
-        """/policy/stop — called by 'Stop Policy' button in the webserver UI."""
+    def _srv_stop(self, _req, response):
+        """/policy/stop — deactivate and restore teleop."""
         try:
             self.on_deactivate(None)
             response.success = True
@@ -335,124 +412,172 @@ class PolicyLifecycleManager(LifecycleNode):
             response.message = str(e)
         return response
 
+    # ================================================================== #
+    # Model helpers
+    # ================================================================== #
     def _load_policy(self, ckpt_path: str):
         """
-        Load policy from checkpoint saved by training/train_act.py.
+        Load ACT policy checkpoint.  Supports two formats:
 
-        Auto-detects whether the checkpoint is state-only (ACTMiniPolicy)
-        or vision+state (ACTVisionPolicy) via the 'use_vision' key.
-        Falls back to random policy if checkpoint not found (demo mode).
+        1. Local .pt file (train_act.py output) — detected when ckpt_path ends
+           with '.pt' or is a regular file.
+           Keys: state_dict, state_dim, action_dim, use_vision, img_dim, …
+
+        2. LeRobot pretrained directory — detected when ckpt_path is a directory.
+           Loaded via ACTPolicy.from_pretrained().
         """
         import os
         if not _TORCH_AVAILABLE:
-            self.get_logger().warn("torch not available — using random policy.")
+            self.get_logger().warn("torch not available — random policy.")
             return None
 
         if not os.path.exists(ckpt_path):
-            self.get_logger().warn(
-                f"Checkpoint not found at {ckpt_path}. Using random policy."
-            )
+            self.get_logger().warn(f"Checkpoint not found at {ckpt_path}. Random policy.")
             return None
 
+        # ---- Local .pt checkpoint (browser training via train_act.py) ----
+        if os.path.isfile(ckpt_path):
+            return self._load_local_pt_policy(ckpt_path)
+
+        # ---- LeRobot pretrained directory (cluster lerobot-train) ----
+        return self._load_lerobot_policy(ckpt_path)
+
+    def _load_local_pt_policy(self, pt_path: str):
+        """Load a .pt checkpoint saved by train_act.py."""
         try:
-            import torch
-            ckpt       = torch.load(ckpt_path, map_location="cpu")
-            state_dim  = ckpt.get("state_dim",  32)
-            action_dim = ckpt.get("action_dim",  4)
-            use_vision = ckpt.get("use_vision", False)
-            img_dim    = ckpt.get("img_dim",    128)
+            ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
+            state_dim  = int(ckpt.get("state_dim",  32))
+            action_dim = int(ckpt.get("action_dim", 4))
+            use_vision = bool(ckpt.get("use_vision", False))
+            img_dim    = int(ckpt.get("img_dim",    128))
 
             if use_vision:
-                policy = ACTVisionPolicy(
+                model = _ACTVisionPolicy(
                     state_dim=state_dim, action_dim=action_dim,
-                    img_dim=img_dim, hidden=512
+                    img_dim=img_dim, hidden=512,
                 )
+                self._use_wrist = False   # local vision model uses top camera only
             else:
-                policy = ACTMiniPolicy(
-                    state_dim=state_dim, action_dim=action_dim, hidden=512
+                model = _ACTMiniPolicy(
+                    state_dim=state_dim, action_dim=action_dim, hidden=512,
                 )
+                self._use_wrist = False
 
-            policy.load_state_dict(ckpt["state_dict"])
-            policy.eval()
+            model.load_state_dict(ckpt["state_dict"])
+            model.eval()
 
-            mode_str = f"vision+state (img_dim={img_dim})" if use_vision else "state-only"
+            # Run on CPU (Docker container may not have CUDA; fast enough for 4D output)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model.to(device)
+
             self.get_logger().info(
-                f"Policy loaded [{mode_str}] — "
+                f"Local ACT checkpoint loaded — "
                 f"state_dim={state_dim}, action_dim={action_dim}, "
+                f"mode={'vision+state' if use_vision else 'state-only'}, "
+                f"epoch={ckpt.get('epoch', '?')}, "
                 f"eval_loss={ckpt.get('eval_loss', float('nan')):.5f}"
             )
+            return _LocalACTWrapper(model, device, use_vision)
 
-            self._state_dim  = state_dim
-            self._action_dim = action_dim
-            self._use_vision = use_vision
+        except Exception as e:
+            self.get_logger().warn(f"Could not load local .pt checkpoint: {e}. Random policy.")
+            return None
+
+    def _load_lerobot_policy(self, ckpt_path: str):
+        """Load a LeRobot pretrained_model directory (cluster training output)."""
+        try:
+            from lerobot.policies.act.modeling_act import ACTPolicy
+            policy = ACTPolicy.from_pretrained(ckpt_path)
+            policy.eval()
+
+            # Detect wrist camera from config
+            cfg = policy.config
+            input_keys = list(getattr(cfg, "input_features", {}).keys())
+            self._use_wrist = "observation.images.wrist" in input_keys
+
+            self.get_logger().info(
+                f"LeRobot ACTPolicy loaded — "
+                f"chunk_size={cfg.chunk_size}, "
+                f"n_action_steps={cfg.n_action_steps}, "
+                f"cameras={'top+wrist' if self._use_wrist else 'top-only'}"
+            )
             return policy
 
         except Exception as e:
-            self.get_logger().warn(f"Could not load checkpoint: {e}. Using random policy.")
+            self.get_logger().warn(f"Could not load LeRobot checkpoint: {e}. Random policy.")
             return None
 
-    def _build_obs(self, image: np.ndarray, joints: list) -> dict:
+    def _build_obs(self, image: np.ndarray,
+                   wrist_image: np.ndarray | None,
+                   joints: list) -> dict:
         """
-        Build observation dict for the policy.
+        Build observation batch for LeRobot ACTPolicy.select_action().
 
-        State-only : {"state": (1, 32)}
-        Vision     : {"state": (1, 32), "image": (1, 3, 224, 224)}
+          observation.state         : (1, 32)  float32
+          observation.images.top    : (1, 3, 480, 640)  float32  [0,1]
+          observation.images.wrist  : (1, 3, 128, 128)  float32  [0,1]  (if used)
         """
-        import torch
-        state_dim = getattr(self, "_state_dim", 32)
-        state     = joints[:state_dim]
-        if len(state) < state_dim:
-            state = state + [0.0] * (state_dim - len(state))
-        state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)  # (1, 32)
-        obs = {"state": state_t}
+        state = joints[:32]
+        if len(state) < 32:
+            state = state + [0.0] * (32 - len(state))
 
-        if getattr(self, "_use_vision", False) and image is not None:
-            # BGR (OpenCV) → RGB → resize → normalise → CHW tensor
-            img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (112, 112))
-            img = img.astype(np.float32) / 255.0
-            img = (img - _IMG_MEAN.reshape(1, 1, 3)) / _IMG_STD.reshape(1, 1, 3)
-            img_t = torch.from_numpy(
-                img.transpose(2, 0, 1)  # HWC → CHW
-            ).unsqueeze(0)             # (1, 3, 224, 224)
-            obs["image"] = img_t
+        obs = {
+            "observation.state": torch.tensor(
+                state, dtype=torch.float32
+            ).unsqueeze(0),   # (1, 32)
+        }
+
+        # Top camera — Docker headless renders at 320×240; resize to training res
+        img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if img.shape[:2] != (self.TOP_H, self.TOP_W):
+            img = cv2.resize(img, (self.TOP_W, self.TOP_H),
+                             interpolation=cv2.INTER_LINEAR)
+        obs["observation.images.top"] = torch.from_numpy(
+            (img.astype(np.float32) / 255.0).transpose(2, 0, 1)
+        ).unsqueeze(0)   # (1, 3, 480, 640)
+
+        # Wrist camera (only included when checkpoint was trained with it)
+        if self._use_wrist and wrist_image is not None:
+            w = cv2.cvtColor(wrist_image, cv2.COLOR_BGR2RGB)
+            if w.shape[:2] != (self.WRIST_H, self.WRIST_W):
+                w = cv2.resize(w, (self.WRIST_W, self.WRIST_H),
+                               interpolation=cv2.INTER_LINEAR)
+            obs["observation.images.wrist"] = torch.from_numpy(
+                (w.astype(np.float32) / 255.0).transpose(2, 0, 1)
+            ).unsqueeze(0)   # (1, 3, 128, 128)
 
         return obs
 
-    def _predict(self, obs: dict, horizon: int) -> list:
+    def _predict(self, obs: dict) -> list:
         """
-        Run inference and return a list of `horizon` actions.
-
-        The same action is repeated for the full chunk — the policy
-        re-queries every `horizon` steps (action chunking).
+        One inference step.  LeRobot's select_action() manages the internal
+        _action_queue — it re-predicts automatically every n_action_steps.
+        Returns a single [dx, dy, dz, gripper] action.
         """
         if self._policy is None:
             self._confidence = 0.0
-            return [
-                np.random.uniform(-0.02, 0.02, size=4).tolist()
-                for _ in range(horizon)
-            ]
+            return np.random.uniform(-0.02, 0.02, size=4).tolist()
 
-        import torch
-        with torch.no_grad():
-            if getattr(self, "_use_vision", False) and "image" in obs:
-                action = self._policy(obs["state"], obs["image"])   # (1, 4)
-            else:
-                action = self._policy(obs["state"])                 # (1, 4)
+        try:
+            with torch.no_grad():
+                action = self._policy.select_action(obs)   # (4,) or (1,4)
 
-        action_np = action.squeeze(0).cpu().numpy()   # (4,)
-        action_np[:3] = np.clip(action_np[:3], -0.4, 0.4)
-        action_np[3]  = np.clip(action_np[3],  -1.0, 1.0)
+            action_np = action.squeeze().cpu().numpy()     # (4,)
+            action_np[:3] = np.clip(action_np[:3], -0.4, 0.4)
+            action_np[3]  = np.clip(action_np[3],  -1.0, 1.0)
+            self._confidence = float(np.abs(action_np).mean())
+            return action_np.tolist()
 
-        self._confidence = float(np.abs(action_np).mean())
-        return [action_np.tolist() for _ in range(horizon)]
+        except Exception as e:
+            self.get_logger().warn(f"Inference error: {e}")
+            self._confidence = 0.0
+            return [0.0, 0.0, 0.0, 0.0]
 
     def _publish_command(self, action: list):
-        """Publish one action step as a JointState command."""
-        cmd = JointState()
+        cmd              = JointState()
         cmd.header.stamp = self.get_clock().now().to_msg()
-        cmd.name     = ["eef_x", "eef_y", "eef_z", "gripper"]
-        cmd.position = [float(v) for v in action[:4]]
+        cmd.name         = ["eef_x", "eef_y", "eef_z", "gripper"]
+        cmd.position     = [float(v) for v in action[:4]]
         self._pub_cmd.publish(cmd)
 
     def _publish_status(self, status: str):

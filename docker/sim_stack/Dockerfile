@@ -84,7 +84,7 @@ RUN pip3 install --no-cache-dir \
 # Copy and build ROS2 workspace
 # CACHE_BUST: increment to force Docker to re-copy source and rerun colcon.
 # --------------------------------------------------------------------------- #
-ARG CACHE_BUST=1
+ARG CACHE_BUST=7
 WORKDIR /ros2_ws
 COPY ros2_ws/src ./src
 
