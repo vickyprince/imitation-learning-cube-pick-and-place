@@ -102,6 +102,11 @@ RENDER_HEIGHT = 240 if _headless else 480
 RENDER_WIDTH  = 320 if _headless else 640
 TARGET_FPS    = 30
 
+# Wrist camera: rendered at 128×128 — small enough for low overhead,
+# large enough for the policy to see cube alignment under the gripper.
+WRIST_HEIGHT = 128
+WRIST_WIDTH  = 128
+
 # Publish camera image every N sim steps (decouples image rate from state rate).
 # State (32D) publishes every step; image publishes every IMAGE_EVERY steps.
 # At 30 Hz sim, IMAGE_EVERY=3 → image at 10 Hz — enough for behaviour cloning.
@@ -311,12 +316,75 @@ class XArmSimNode(Node):
             self._gripper_geom_ids: set[int] = set()
 
         # ------------------------------------------------------------------ #
+        # Wrist camera — free camera that follows the EEF site each frame.
+        #
+        # Design notes:
+        #   • Uses mjCAMERA_FREE (not TRACKING): tracking cameras in mujoco
+        #     Python 2.x do not update lookat via update_scene(), so the view
+        #     defaults to world origin [0,0,0] while the robot is at X≈-1.8m
+        #     → black image.
+        #   • Dedicated mujoco.Renderer (separate from gym's renderer).
+        #     gym_xarm's Lift class does NOT expose mujoco_renderer, so we
+        #     cannot reuse gym's renderer. A dedicated renderer is fine here:
+        #     the lookat bug (not dual-context) was the original cause of the
+        #     black image, and that is fixed by using mjCAMERA_FREE.
+        #   • lookat is updated to data.site_xpos[eef_site_id] each step.
+        #   • elevation = -75: in MuJoCo convention this puts the camera
+        #     above the lookat looking mostly downward (confirmed by default
+        #     viewer using elevation = -20 for an above-scene view).
+        # ------------------------------------------------------------------ #
+        self._wrist_cam      = None
+        self._wrist_renderer = None
+        try:
+            import mujoco as _mj
+            model = self._env.unwrapped.model
+
+            # Confirm body exists (for logging only)
+            wrist_body_id = _mj.mj_name2id(model, _mj.mjtObj.mjOBJ_BODY, "link7")
+            if wrist_body_id < 0:
+                for candidate in ["link_tcp", "link6", "wrist", "gripper_base"]:
+                    wrist_body_id = _mj.mj_name2id(model, _mj.mjtObj.mjOBJ_BODY, candidate)
+                    if wrist_body_id >= 0:
+                        break
+
+            cam = _mj.MjvCamera()
+            cam.type      = int(_mj.mjtCamera.mjCAMERA_FREE)
+            cam.distance  = 0.30   # 30 cm from lookat
+            cam.elevation = -75.0  # camera above, looking mostly down (MuJoCo: negative = above)
+            cam.azimuth   = 90.0   # face same direction as default viewer
+            # lookat will be set to EEF site position on every render frame
+            self._wrist_cam = cam
+
+            # gym_xarm model XML sets offscreen framebuffer to 84×84 by default.
+            # gymnasium lazily creates its own renderer (on first render() call),
+            # so it hasn't bumped the offscreen size yet when we get here.
+            # Manually raise offwidth/offheight to fit both renderers now.
+            model.vis.global_.offwidth  = max(
+                int(model.vis.global_.offwidth),  RENDER_WIDTH,  WRIST_WIDTH
+            )
+            model.vis.global_.offheight = max(
+                int(model.vis.global_.offheight), RENDER_HEIGHT, WRIST_HEIGHT
+            )
+
+            # Dedicated renderer — renders at wrist resolution directly
+            self._wrist_renderer = _mj.Renderer(model, WRIST_HEIGHT, WRIST_WIDTH)
+
+            self.get_logger().info(
+                f"Wrist camera ready (FREE cam, body id={wrist_body_id}). "
+                f"Rendering at {WRIST_WIDTH}×{WRIST_HEIGHT} via dedicated mujoco.Renderer."
+            )
+        except Exception as e:
+            self.get_logger().warn(f"Wrist camera init failed: {e}. Wrist feed disabled.")
+
+        # ------------------------------------------------------------------ #
         # Publishers
         # ------------------------------------------------------------------ #
         self._bridge = CvBridge()
 
-        self._pub_img    = self.create_publisher(
+        self._pub_img       = self.create_publisher(
             CompressedImage,  "/sim/camera/image_compressed", 10)
+        self._pub_wrist_img = self.create_publisher(
+            CompressedImage,  "/sim/camera/wrist/image_compressed", 10)
         self._pub_js     = self.create_publisher(
             JointState,       "/sim/joint_states", 10)
         self._pub_ee     = self.create_publisher(
@@ -494,6 +562,7 @@ class XArmSimNode(Node):
         # State (32D) always publishes at TARGET_FPS; image publishes at
         # TARGET_FPS / IMAGE_EVERY (e.g. 30/3 = 10 Hz in headless mode).
         if self._step_count % IMAGE_EVERY == 0:
+            # --- Top/side camera (via gym render) -------------------------- #
             try:
                 pixels = self._env.render()  # (H, W, 3) uint8 RGB
                 if pixels is not None:
@@ -507,6 +576,42 @@ class XArmSimNode(Node):
                     self._pub_img.publish(img_msg)
             except Exception:
                 pass  # rendering failure should never crash the state loop
+
+            # --- Wrist camera (FREE cam, dedicated mujoco.Renderer) --------- #
+            # gym_xarm's Lift class does not expose mujoco_renderer, so we
+            # use a dedicated mujoco.Renderer initialised in __init__.
+            # The lookat bug (mjCAMERA_TRACKING + mujoco 2.x) is avoided by
+            # using mjCAMERA_FREE with an explicit lookat update each frame.
+            if self._wrist_cam is not None and self._wrist_renderer is not None:
+                try:
+                    mj_data = self._env.unwrapped.data
+
+                    # Snap lookat to the EEF site position each frame
+                    if self._eef_site_id >= 0:
+                        self._wrist_cam.lookat[:] = np.array(
+                            mj_data.site_xpos[self._eef_site_id], dtype=np.float64
+                        )
+
+                    self._wrist_renderer.update_scene(mj_data, camera=self._wrist_cam)
+                    wrist_pixels = self._wrist_renderer.render()  # (WRIST_H, WRIST_W, 3) RGB
+
+                    bgr_w = cv2.cvtColor(wrist_pixels, cv2.COLOR_RGB2BGR)
+                    # Rotate + flip to align wrist-cam axes with main (side) camera.
+                    # 90° CW fixes X/Y swap; vertical flip corrects inverted Y.
+                    bgr_w = cv2.rotate(bgr_w, cv2.ROTATE_90_CLOCKWISE)
+                    bgr_w = cv2.flip(bgr_w, 0)   # 0 = flip vertically (Y axis)
+                    _, wbuf = cv2.imencode(".jpg", bgr_w, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    w_msg                 = CompressedImage()
+                    w_msg.header.stamp    = now
+                    w_msg.header.frame_id = "wrist_camera"
+                    w_msg.format          = "jpeg"
+                    w_msg.data            = wbuf.tobytes()
+                    self._pub_wrist_img.publish(w_msg)
+                except Exception as _wrist_err:
+                    # Log once, then suppress — rendering failure must not crash state loop
+                    if not getattr(self, "_wrist_err_logged", False):
+                        self.get_logger().warn(f"Wrist cam render error: {_wrist_err}")
+                        self._wrist_err_logged = True
 
         # --- Full 32D state vector ----------------------------------------- #
         state = self._extract_state_32d()
@@ -577,6 +682,11 @@ class XArmSimNode(Node):
         return response
 
     def destroy_node(self):
+        if self._wrist_renderer is not None:
+            try:
+                self._wrist_renderer.close()
+            except Exception:
+                pass
         self._env.close()
         super().destroy_node()
 

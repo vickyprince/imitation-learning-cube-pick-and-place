@@ -104,17 +104,35 @@ class XArmLiftDataset(Dataset):
         self._df = pd.concat(dfs, ignore_index=True)
 
         # ---- State columns (32D) ----
-        state_cols = [f"observation.state.{n}" for n in STATE_NAMES_32D]
-        available  = [c for c in state_cols if c in self._df.columns]
-        if not available:
-            available = sorted(c for c in self._df.columns
-                               if c.startswith("observation.state."))
-        self._states = self._df[available].values.astype(np.float32)
+        # Support two formats:
+        #   New (list column):      "observation.state"  → each cell is a list[float]
+        #   Old (individual cols):  "observation.state.ee_x", "observation.state.ee_y", ...
+        if "observation.state" in self._df.columns:
+            self._states = np.array(
+                self._df["observation.state"].tolist(), dtype=np.float32
+            )
+        else:
+            state_cols = [f"observation.state.{n}" for n in STATE_NAMES_32D]
+            available  = [c for c in state_cols if c in self._df.columns]
+            if not available:
+                available = sorted(c for c in self._df.columns
+                                   if c.startswith("observation.state."))
+            self._states = self._df[available].values.astype(np.float32)
         actual_state_dim = self._states.shape[1]
 
         # ---- Action columns (4D) ----
-        action_cols      = sorted(c for c in self._df.columns if c.startswith("action."))
-        self._actions    = self._df[action_cols].values.astype(np.float32)
+        # Support two formats:
+        #   New (list column):      "action"     → each cell is a list[float]
+        #   Old (individual cols):  "action.0", "action.1", ...
+        if "action" in self._df.columns and not any(
+            c.startswith("action.") for c in self._df.columns
+        ):
+            self._actions = np.array(
+                self._df["action"].tolist(), dtype=np.float32
+            )
+        else:
+            action_cols   = sorted(c for c in self._df.columns if c.startswith("action."))
+            self._actions = self._df[action_cols].values.astype(np.float32)
 
         print(
             f"  [{split}] {len(self._df)} frames, {len(files)} episodes | "

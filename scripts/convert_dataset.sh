@@ -6,5 +6,5 @@ docker compose -f docker/docker-compose.yml run --rm sim_stack \
            source /ros2_ws/install/setup.bash && \
            ros2 run dataset_pipeline rosbag2_to_lerobot \
              --bags_dir /data/bags \
-             --output_dir /data/datasets/xarm_lift_v1 \
+             --output_dir /data/datasets/xarm_lift_v2_fresh \
              --task_name xarm_lift"

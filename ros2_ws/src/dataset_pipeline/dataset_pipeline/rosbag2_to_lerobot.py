@@ -211,13 +211,17 @@ def bag_to_episode(
     """
     msgs = read_bag(bag_path)
 
-    js_topic  = "/sim/joint_states"    # 32D state vector
-    cmd_topic = "/sim/joint_command"   # 4D action
-    img_topic = "/sim/camera/image_compressed"
+    js_topic    = "/sim/joint_states"                       # 32D state vector
+    cmd_topic   = "/sim/joint_command"                      # 4D action
+    img_topic   = "/sim/camera/image_compressed"            # top/side camera
+    wrist_topic = "/sim/camera/wrist/image_compressed"      # wrist camera
 
-    js_msgs   = msgs.get(js_topic,  [])
-    cmd_msgs  = msgs.get(cmd_topic, [])
-    img_msgs  = msgs.get(img_topic, [])
+    js_msgs     = msgs.get(js_topic,    [])
+    cmd_msgs    = msgs.get(cmd_topic,   [])
+    img_msgs    = msgs.get(img_topic,   [])
+    wrist_msgs  = msgs.get(wrist_topic, [])
+
+    has_wrist = len(wrist_msgs) > 0
 
     if not js_msgs:
         print(f"  WARNING: No joint_states in {bag_path}, skipping.")
@@ -225,19 +229,34 @@ def bag_to_episode(
 
     n_frames = len(js_msgs)
 
-    # ---- Video writer -------------------------------------------------------
-    ep_str    = f"episode_{episode_idx:06d}"
-    video_dir = os.path.join(
+    # ---- Video writers ------------------------------------------------------
+    ep_str = f"episode_{episode_idx:06d}"
+
+    # Top camera
+    top_video_dir = os.path.join(
         output_dir, "videos", f"chunk-{chunk:03d}", "observation.images.top"
     )
-    os.makedirs(video_dir, exist_ok=True)
-    video_path = os.path.join(video_dir, f"{ep_str}.mp4")
+    os.makedirs(top_video_dir, exist_ok=True)
+    top_video_path = os.path.join(top_video_dir, f"{ep_str}.mp4")
 
     sample_img = decode_compressed_image(nearest(img_msgs, js_msgs[0][0]))
     h, w       = (480, 640) if sample_img is None else sample_img.shape[:2]
-    writer     = cv2.VideoWriter(
-        video_path, cv2.VideoWriter_fourcc(*"mp4v"), 30, (w, h)
+    top_writer = cv2.VideoWriter(
+        top_video_path, cv2.VideoWriter_fourcc(*"mp4v"), 30, (w, h)
     )
+
+    # Wrist camera (128×128)
+    wrist_writer = None
+    wrist_video_path = None
+    if has_wrist:
+        wrist_video_dir = os.path.join(
+            output_dir, "videos", f"chunk-{chunk:03d}", "observation.images.wrist"
+        )
+        os.makedirs(wrist_video_dir, exist_ok=True)
+        wrist_video_path = os.path.join(wrist_video_dir, f"{ep_str}.mp4")
+        wrist_writer = cv2.VideoWriter(
+            wrist_video_path, cv2.VideoWriter_fourcc(*"mp4v"), 30, (128, 128)
+        )
 
     # ---- Build rows --------------------------------------------------------
     rows = []
@@ -245,12 +264,24 @@ def bag_to_episode(
         state  = extract_state_32d(js_msg)
         action = extract_action_4d(nearest(cmd_msgs, ts))
 
+        # Top camera frame
         img_msg = nearest(img_msgs, ts)
         frame   = decode_compressed_image(img_msg) if img_msg else None
         if frame is not None:
-            writer.write(frame)
+            top_writer.write(frame)
         else:
-            writer.write(np.zeros((h, w, 3), np.uint8))
+            top_writer.write(np.zeros((h, w, 3), np.uint8))
+
+        # Wrist camera frame
+        if has_wrist and wrist_writer is not None:
+            w_msg   = nearest(wrist_msgs, ts)
+            w_frame = decode_compressed_image(w_msg) if w_msg else None
+            if w_frame is not None:
+                if w_frame.shape[:2] != (128, 128):
+                    w_frame = cv2.resize(w_frame, (128, 128))
+                wrist_writer.write(w_frame)
+            else:
+                wrist_writer.write(np.zeros((128, 128, 3), np.uint8))
 
         rows.append({
             "episode_index": episode_idx,
@@ -261,7 +292,11 @@ def bag_to_episode(
             "next.done":    (frame_idx == n_frames - 1),
         })
 
-    writer.release()
+    top_writer.release()
+    if wrist_writer is not None:
+        wrist_writer.release()
+
+    video_path = top_video_path  # keep for metadata compat
 
     # ---- Write Parquet -------------------------------------------------------
     parquet_dir = os.path.join(output_dir, "data", f"chunk-{chunk:03d}")
@@ -269,30 +304,52 @@ def bag_to_episode(
 
     df = pd.DataFrame(rows)
 
-    # Expand list columns to individual float columns for Parquet compatibility
-    for col, names in [
-        ("observation.state", [f"observation.state.{n}" for n in STATE_NAMES_32D]),
-        ("action",            [f"action.{i}"             for i in range(ACTION_DIM)]),
-    ]:
-        expanded = pd.DataFrame(
-            df[col].tolist(), columns=names
-        )
-        df = pd.concat([df.drop(columns=[col]), expanded], axis=1)
+    # Write observation.state and action as fixed-size float32 list columns.
+    # LeRobot (v2.1 and v3.0) expects list<float32>[D] columns — NOT individual
+    # per-channel columns.  Writing them directly here avoids any downstream
+    # column-merge step that could accidentally zero out the values.
+    for col, dim in [("observation.state", STATE_DIM), ("action", ACTION_DIM)]:
+        target_type = pa.list_(pa.float32(), dim)
+        arr = np.array(df[col].tolist(), dtype=np.float32)   # (N, dim)
+        df[col] = pd.Series(arr.tolist())                     # list-of-lists
 
-    table = pa.Table.from_pandas(df)
+    # task_index required by lerobot-train
+    if "task_index" not in df.columns:
+        df["task_index"] = 0
+
+    # Rewrite timestamps as (local_frame_index / fps) — deterministic,
+    # no ROS clock jitter, no out-of-bounds video frame indices.
+    fps = 30.0
+    df["timestamp"] = (df.groupby("episode_index", sort=False).cumcount() / fps)
+
+    table = pa.Table.from_pandas(df, preserve_index=False)
+
+    # Cast list columns to fixed-size list<float32>[D] (LeRobot requirement)
+    for col, dim in [("observation.state", STATE_DIM), ("action", ACTION_DIM)]:
+        idx = table.schema.get_field_index(col)
+        if idx >= 0:
+            target_type = pa.list_(pa.float32(), dim)
+            if table.schema.field(col).type != target_type:
+                data = np.array(table[col].to_pylist(), dtype=np.float32)
+                table = table.set_column(idx, col,
+                    pa.array(data.tolist(), type=target_type))
+
     pq.write_table(table, os.path.join(parquet_dir, f"{ep_str}.parquet"))
 
+    cam_str = "top+wrist" if has_wrist else "top-only"
     print(
         f"  ✓ Episode {episode_idx}: {n_frames} frames "
-        f"→ {ep_str}.parquet (32D state + 4D action) + .mp4"
+        f"→ {ep_str}.parquet (32D state + 4D action) + .mp4 [{cam_str}]"
     )
 
     return {
-        "episode_index": episode_idx,
-        "tasks":         ["xarm_lift"],
-        "length":        n_frames,
-        "video_path":    video_path,
-        "parquet_path":  os.path.join(parquet_dir, f"{ep_str}.parquet"),
+        "episode_index":   episode_idx,
+        "tasks":           ["xarm_lift"],
+        "length":          n_frames,
+        "has_wrist":       has_wrist,
+        "video_path":      video_path,
+        "wrist_video_path": wrist_video_path,
+        "parquet_path":    os.path.join(parquet_dir, f"{ep_str}.parquet"),
     }
 
 
@@ -304,13 +361,20 @@ def write_dataset_meta(output_dir: str, episodes: list[dict], task_name: str):
     os.makedirs(meta_dir, exist_ok=True)
 
     total_frames = sum(e.get("length", 0) for e in episodes)
+    has_wrist    = any(e.get("has_wrist", False) for e in episodes)
 
     info = {
         "codebase_version": "v2.1",
         "robot_type":       "xarm6",
         "total_episodes":   len(episodes),
         "total_frames":     total_frames,
+        "total_videos":     len(episodes) * (2 if has_wrist else 1),
+        "total_chunks":     1,
+        "chunks_size":      1000,
         "fps":              30,
+        "data_path":  "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        "splits":     {"train": f"0:{total_frames}"},
         "tasks":            [task_name],
         "features": {
             "observation.state": {
@@ -334,6 +398,13 @@ def write_dataset_meta(output_dir: str, episodes: list[dict], task_name: str):
                 "shape":  [480, 640, 3],
                 "names":  ["height", "width", "channel"],
             },
+            **( {
+                "observation.images.wrist": {
+                    "dtype":  "video",
+                    "shape":  [128, 128, 3],
+                    "names":  ["height", "width", "channel"],
+                }
+            } if has_wrist else {} ),
         },
         "created_at":  datetime.utcnow().isoformat() + "Z",
         "description": (

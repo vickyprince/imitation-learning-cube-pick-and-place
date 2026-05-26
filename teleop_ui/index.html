@@ -85,11 +85,19 @@
     grid-row: 2;
     grid-column: 1;
     background: #000;
+    display: grid;
+    grid-template-columns: 1fr 160px;
+    border-right: 1px solid var(--border);
+    overflow: hidden;
+  }
+  #top-cam-wrap {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: center;
-    position: relative;
+    background: #000;
     border-right: 1px solid var(--border);
+    min-width: 0;
   }
   #camera-canvas {
     max-width: 100%;
@@ -98,13 +106,67 @@
   }
   #camera-overlay {
     position: absolute;
-    top: 10px;
-    left: 10px;
-    background: rgba(0,0,0,0.6);
-    padding: 4px 10px;
-    border-radius: 6px;
-    font-size: 11px;
+    top: 8px; left: 8px;
+    background: rgba(0,0,0,0.65);
+    padding: 3px 8px;
+    border-radius: 5px;
+    font-size: 10px;
     color: var(--muted);
+  }
+  /* Wrist camera column */
+  #wrist-cam-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    background: #0a0a0f;
+    padding: 10px 8px;
+    gap: 8px;
+  }
+  #wrist-label {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  #wrist-canvas {
+    width: 144px;
+    height: 144px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: #111;
+  }
+  /* Crosshair overlay on wrist cam */
+  #wrist-cam-wrap { position: relative; }
+  #wrist-crosshair {
+    position: absolute;
+    top: 42px; left: 8px;
+    width: 144px; height: 144px;
+    pointer-events: none;
+  }
+  /* Confidence bar */
+  #conf-bar-wrap {
+    width: 144px;
+  }
+  #conf-bar-label {
+    font-size: 9px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .06em;
+    margin-bottom: 3px;
+    display: flex; justify-content: space-between;
+  }
+  #conf-bar-bg {
+    height: 8px; background: var(--border);
+    border-radius: 4px; overflow: hidden;
+  }
+  #conf-bar-fill {
+    height: 100%; width: 0%;
+    border-radius: 4px;
+    background: var(--green);
+    transition: width 0.15s, background 0.15s;
+  }
+  #wrist-no-signal {
+    font-size: 9px; color: var(--muted); text-align: center;
   }
 
   /* ── Right sidebar ── */
@@ -317,10 +379,38 @@
   <button id="conn-btn" onclick="connectROS()">Connect</button>
 </header>
 
-<!-- ── Camera ── -->
+<!-- ── Camera panel (top + wrist side by side) ── -->
 <div id="camera-panel">
-  <canvas id="camera-canvas" width="640" height="480"></canvas>
-  <div id="camera-overlay">No image yet</div>
+  <!-- Top / side camera (main view) -->
+  <div id="top-cam-wrap">
+    <canvas id="camera-canvas" width="640" height="480"></canvas>
+    <div id="camera-overlay">top cam — no image</div>
+  </div>
+
+  <!-- Wrist camera (grasp alignment) -->
+  <div id="wrist-cam-wrap">
+    <div id="wrist-label">Wrist Cam</div>
+    <canvas id="wrist-canvas" width="128" height="128"></canvas>
+    <!-- Crosshair: helps center gripper over cube -->
+    <svg id="wrist-crosshair" viewBox="0 0 144 144" xmlns="http://www.w3.org/2000/svg">
+      <line x1="72" y1="20" x2="72" y2="124" stroke="rgba(255,80,80,0.55)" stroke-width="1.2" stroke-dasharray="4,3"/>
+      <line x1="20" y1="72" x2="124" y2="72" stroke="rgba(255,80,80,0.55)" stroke-width="1.2" stroke-dasharray="4,3"/>
+      <circle cx="72" cy="72" r="10" fill="none" stroke="rgba(255,80,80,0.4)" stroke-width="1.2"/>
+    </svg>
+
+    <!-- Confidence bar -->
+    <div id="conf-bar-wrap">
+      <div id="conf-bar-label">
+        <span>Confidence</span>
+        <span id="conf-val">—</span>
+      </div>
+      <div id="conf-bar-bg">
+        <div id="conf-bar-fill"></div>
+      </div>
+    </div>
+
+    <div id="wrist-no-signal">waiting for wrist feed…</div>
+  </div>
 </div>
 
 <!-- ── Sidebar ── -->
@@ -358,10 +448,6 @@
       <div class="metric-pill">
         <div class="label">Confidence</div>
         <div class="value" id="policy-conf">—</div>
-      </div>
-      <div class="metric-pill">
-        <div class="label">Success Rate</div>
-        <div class="value" id="policy-success" style="color:var(--green)">0 / 0</div>
       </div>
     </div>
   </div>
@@ -548,8 +634,8 @@ function startTraining() {
   // 1. Publish config
   const config = {
     bags_dir:     '/data/bags',
-    dataset_dir:  '/data/datasets/xarm_lift_v1',
-    output_dir:   '/data/checkpoints/xarm_lift_v1',
+    dataset_dir:  '/data/datasets/xarm_lift_v2_fresh',
+    output_dir:   '/data/checkpoints/xarm_lift_v2',
     task_name:    'xarm_lift',
     auto_convert: autoConvert,
     epochs:       parseInt(document.getElementById('train-epochs').value) || 2,
@@ -756,18 +842,22 @@ function setupSubscribers() {
   });
 
   sub('/policy/confidence', 'std_msgs/Float32', (m) => {
-    document.getElementById('policy-conf').textContent = m.data.toFixed(3);
+    const c = m.data;
+    document.getElementById('policy-conf').textContent = c.toFixed(3);
+    // Wrist panel confidence bar — scale 0..0.3 → 0%..100%
+    const pct = Math.min(100, (c / 0.3) * 100);
+    const fill = document.getElementById('conf-bar-fill');
+    const valEl = document.getElementById('conf-val');
+    if (fill) {
+      fill.style.width = pct + '%';
+      fill.style.background = c < 0.05 ? 'var(--red)' : c < 0.12 ? 'var(--yellow)' : 'var(--green)';
+    }
+    if (valEl) valEl.textContent = c.toFixed(3);
   });
 
   // Task completion — update success counter, show toast, auto-return to teleop
   sub('/sim/task_complete', 'std_msgs/Bool', (m) => {
     if (m.data) {
-      // Only count if policy was active (not teleop manual success)
-      if (_trainingStatus !== 'running' && policyState === 'active') {
-        _policyAttempts++;
-        _policySuccesses++;
-        _updateSuccessDisplay();
-      }
       const toast = document.getElementById('task-toast');
       toast.style.display = 'block';
       setMode('teleop');
@@ -778,8 +868,13 @@ function setupSubscribers() {
     }
   });
 
-  // Camera feed
-  subCamera('/sim/camera/image_compressed');
+  // Top camera feed
+  subCamera('/sim/camera/image_compressed', 'camera-canvas', 'camera-overlay');
+
+  // Wrist camera feed
+  subCamera('/sim/camera/wrist/image_compressed', 'wrist-canvas', null, () => {
+    document.getElementById('wrist-no-signal').style.display = 'none';
+  });
 }
 
 function sub(topic, type, cb) {
@@ -788,23 +883,28 @@ function sub(topic, type, cb) {
   listeners.push(l);
 }
 
-function subCamera(topic) {
+function subCamera(topic, canvasId, overlayId, onFirstFrame) {
+  let gotFirst = false;
   const l = new ROSLIB.Topic({
     ros,
     name: topic,
     messageType: 'sensor_msgs/CompressedImage',
-    throttle_rate: 66,   // ~15 fps from bridge (sim runs at 14 Hz)
+    throttle_rate: 66,   // ~15 fps from bridge
     queue_length: 1,
   });
   l.subscribe((m) => {
     const img = new Image();
     img.onload = () => {
-      const canvas = document.getElementById('camera-canvas');
+      const canvas = document.getElementById(canvasId);
+      if (!canvas) return;
       canvas.width  = img.width;
       canvas.height = img.height;
       canvas.getContext('2d').drawImage(img, 0, 0);
-      document.getElementById('camera-overlay').textContent =
-        img.width + '×' + img.height;
+      if (overlayId) {
+        const ov = document.getElementById(overlayId);
+        if (ov) ov.textContent = img.width + '×' + img.height;
+      }
+      if (!gotFirst && onFirstFrame) { gotFirst = true; onFirstFrame(); }
     };
     img.src = 'data:image/jpeg;base64,' + m.data;
   });
@@ -843,24 +943,6 @@ function discardEpisode() {
 // Transition IDs: CONFIGURE=1, CLEANUP=2, ACTIVATE=3, DEACTIVATE=4
 // ============================================================================
 
-// Success rate tracking — reset on page reload, persists across Run/Stop cycles
-let _policyAttempts  = 0;
-let _policySuccesses = 0;
-
-function _updateSuccessDisplay() {
-  const el  = document.getElementById('policy-success');
-  if (!el) return;
-  const pct = _policyAttempts > 0
-    ? ` (${Math.round(_policySuccesses / _policyAttempts * 100)}%)`
-    : '';
-  el.textContent = `${_policySuccesses} / ${_policyAttempts}${pct}`;
-  el.style.color = _policyAttempts === 0 ? 'var(--muted)'
-    : _policySuccesses / _policyAttempts >= 0.6 ? 'var(--green)' : 'var(--yellow)';
-}
-
-function resetSuccessCounter() {
-  _policyAttempts = 0; _policySuccesses = 0; _updateSuccessDisplay();
-}
 let policyState = 'unconfigured';  // unconfigured | configured | active | inactive
 
 function lifecycleTransition(transitionId, label, onSuccess) {
@@ -887,9 +969,6 @@ function lifecycleTransition(transitionId, label, onSuccess) {
 function runPolicy() {
   if (!ros) return;
   log('Policy: starting…');
-  // Each Run Policy click = one attempt
-  _policyAttempts++;
-  _updateSuccessDisplay();
   const svc = new ROSLIB.Service({ ros, name: '/policy/run', serviceType: 'std_srvs/Trigger' });
   svc.callService(new ROSLIB.ServiceRequest({}), (r) => {
     if (r && r.success) {

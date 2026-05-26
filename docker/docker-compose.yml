@@ -41,6 +41,8 @@ services:
       - ../data/bags:/data/bags
       - ../data/datasets:/data/datasets
       - ../data/checkpoints:/data/checkpoints
+      # LeRobot ACT checkpoints from cluster training (job 142916)
+      - ../checkpoints:/data/lerobot_checkpoints
     ports:
       # rosbridge WebSocket — browser ↔ ROS2 bridge
       - "9090:9090"

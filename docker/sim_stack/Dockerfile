@@ -47,6 +47,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Python: MuJoCo + gym_xarm + CV + dataset tools
 # MuJoCo 2.3.x ships pre-built wheels for linux-aarch64 (M1 ARM64 in Docker)
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Heavy ML deps — separate layer so Docker cache skips re-downloading
+# torch/torchvision/lerobot (~1.5 GB) when only source code changes.
+# --------------------------------------------------------------------------- #
+RUN pip3 install --no-cache-dir \
+    torch \
+    torchvision \
+    lerobot
+
+# Pre-cache ResNet18 ImageNet weights so first inference doesn't stall.
+RUN python3 -c "import torchvision; torchvision.models.resnet18(weights='IMAGENET1K_V1'); print('ResNet18 weights cached.')"
+
+# --------------------------------------------------------------------------- #
+# Simulation / ROS2 Python deps
+# --------------------------------------------------------------------------- #
 RUN pip3 install --no-cache-dir \
     "mujoco>=2.3.7,<3.0.0" \
     "gymnasium==0.29.1" \
@@ -62,15 +77,14 @@ RUN pip3 install --no-cache-dir \
     huggingface_hub \
     safetensors \
     einops \
-    torch \
-    torchvision \
-    # For dataset stats / plots
     matplotlib \
     scipy
 
 # --------------------------------------------------------------------------- #
 # Copy and build ROS2 workspace
+# CACHE_BUST: increment to force Docker to re-copy source and rerun colcon.
 # --------------------------------------------------------------------------- #
+ARG CACHE_BUST=1
 WORKDIR /ros2_ws
 COPY ros2_ws/src ./src
 
