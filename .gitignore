@@ -11,6 +11,10 @@ data/checkpoints/*
 !data/datasets/.gitkeep
 !data/checkpoints/.gitkeep
 
+# Cluster / LeRobot checkpoints (large model weights — not for git)
+checkpoints/
+data/lerobot_checkpoints/
+
 # -----------------------------------------------------------------------
 # ROS2 workspace build artifacts
 # -----------------------------------------------------------------------
