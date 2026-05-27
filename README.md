@@ -1,19 +1,58 @@
 
+# MYBOTSHOP Imitation Learning Platform — Vision Branch
 
+**End-to-end imitation learning for xARM6 pick-and-place using a full
+[LeRobot](https://github.com/huggingface/lerobot) ACT policy — a CVAE-augmented transformer
+with a ResNet18 vision backbone, trained on GPU and deployed via a browser-based
+teleoperation UI and ROS2.**
 
+> The `main` branch demonstrates the complete pipeline with a lightweight state-only MLP policy.
+> This branch upgrades Stage 5–6 to a production-grade ACT transformer: the same browser UI,
+> the same ROS2 topics, the same Docker stack — but with a transformer that sees the camera
+> and predicts 50 future actions in a single forward pass.
 
-# MYBOTSHOP Imitation Learning Platform
-
-**ROS2-native robotic learning operations platform for xARM6 pick-and-place,
-integrated end-to-end with a browser-based teleoperation UI.**
-
-> The full pipeline — demonstration collection, dataset conversion, policy
-> training, and deployment — is driven from the browser. No terminal access
-> is required during normal operation.
-
-**ACT policy inference — autonomous pick-and-place after training:**
+**Policy inference — autonomous pick-and-place after training:**
 
 <video src="https://github.com/user-attachments/assets/6ddb8433-11dd-4262-95a0-f0d665992b32" autoplay loop muted playsinline width="100%"></video>
+
+---
+
+## Policy Architecture
+
+```
+Top camera (480×640 RGB)          32D proprioceptive state
+         ↓                                  ↓
+   ResNet18 encoder             Linear projection (state embedding)
+   (ImageNet pretrained)                     ↓
+         ↓                                  ↓
+         └──────── fused token sequence ────┘
+                              ↓
+              CVAE encoder  (training only)
+              encodes the ground-truth action sequence
+              into a latent style vector z ~ N(0,1)
+                              ↓
+              Transformer decoder
+              cross-attends to visual + state tokens
+              conditioned on z (or z=0 at inference)
+                              ↓
+          chunk of 50 future EEF delta actions predicted
+          in a single forward pass
+              ↓
+          execute 10 actions → re-query transformer → repeat
+```
+
+| Parameter | Value |
+|---|---|
+| Vision backbone | ResNet18 (ImageNet pretrained, torchvision) |
+| Camera input | Top view 480×640 RGB |
+| Proprioceptive input | 32D state vector |
+| Action output | 4D EEF delta (dx, dy, dz, gripper) |
+| `chunk_size` | 50 actions predicted per forward pass |
+| `n_action_steps` | 10 actions executed before re-querying |
+| Training framework | LeRobot (HuggingFace) |
+| Training steps | 100 000 |
+| Final eval loss | 0.034 |
+| Checkpoint | `xarm_act_142952` (H-BRS University GPU cluster) |
 
 ---
 
@@ -21,19 +60,18 @@ integrated end-to-end with a browser-based teleoperation UI.**
 
 ```
 Browser UI (http://localhost:9000)
-  ├── Camera feed         ← /sim/camera/image_compressed
-  ├── Joystick            → /joy → teleop_node → /sim/joint_command
-  ├── Record buttons      → /recording/start|stop|discard
-  ├── Train button        → /training/config + /training/start
-  │                         (auto-converts bags, then trains)
-  └── Policy buttons      → /policy/run | /policy/stop
-                          ← /policy/status | /policy/confidence | /policy/inference_fps
+  ├── Top + wrist camera feed  ← /sim/camera/image_compressed
+  │                            ← /sim/camera/wrist/image_compressed
+  ├── Joystick                 → /joy → teleop_node → /sim/joint_command
+  ├── Record buttons           → /recording/start|stop|discard
+  └── Policy buttons           → /policy/run | /policy/stop
+                               ← /policy/status | /policy/confidence | /policy/inference_fps
 
 Stage 1  Simulation       xarm_sim_node    gym_xarm XArmLift-v0 (MuJoCo)
 Stage 2  Teleoperation    teleop_node      /joy → Cartesian delta → gym action
 Stage 3  Recording        recording_manager → rosbag2 bags
 Stage 4  Dataset          rosbag2_to_lerobot → LeRobot Parquet + MP4
-Stage 5  Training         training_manager → train_act.py  (ACT behaviour cloning)
+Stage 5  Training         lerobot-train → ACTPolicy (ResNet18 + CVAE + transformer)
 Stage 6  Deployment       policy_node      ROS2 lifecycle node, ACT inference @ 30 Hz
 Stage 7  Safety           watchdog_node    confidence + joint limits + manual override
 ```
@@ -43,9 +81,14 @@ Stage 7  Safety           watchdog_node    confidence + joint limits + manual ov
 ## Quick Start
 
 ```bash
-git clone https://github.com/vickyprince/imitation-learning-cube-pick-and-place.git
+git clone -b feature/vision-act-cluster-training \
+    https://github.com/vickyprince/imitation-learning-cube-pick-and-place.git
 cd imitation-learning-cube-pick-and-place
 ```
+
+The LeRobot ACT checkpoint must be present at `checkpoints/xarm_act_142952/` before
+starting Docker. The `docker-compose.yml` volume-mounts `../checkpoints` into the
+container at `/data/lerobot_checkpoints/`.
 
 ---
 
@@ -58,22 +101,15 @@ docker compose -f docker/docker-compose.yml build sim_stack
 docker compose -f docker/docker-compose.yml up
 ```
 
-Open **http://localhost:9000** — no login required. The camera feed appears within a few seconds.
-
-For policy training, run `train_act.py` directly on the Mac (outside Docker) to use the MPS GPU — ~10× faster than Docker CPU:
-
-```bash
-python3 training/train_act.py \
-    --dataset_dir data/datasets/xarm_lift_v1 \
-    --output_dir  data/checkpoints/xarm_lift_v1 \
-    --epochs 200
-```
+Open **http://localhost:9000** — no login required. The top-view and wrist camera feeds
+appear within a few seconds. Click **▶ Run Policy** to start ACT inference.
 
 ---
 
 ### Ubuntu
 
-Docker is the recommended approach on Ubuntu too — it handles all ROS2 and MuJoCo dependencies automatically. The only difference from Mac is that NVIDIA GPUs use the EGL renderer instead of OSMesa.
+Docker handles all ROS2 and MuJoCo dependencies automatically. NVIDIA GPUs use the
+EGL renderer instead of OSMesa.
 
 **Prerequisites:** Docker + [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
 
@@ -88,8 +124,6 @@ sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 ```
 
-Then build and run with EGL (GPU-accelerated headless rendering):
-
 ```bash
 # Override the MuJoCo GL backend for NVIDIA
 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
@@ -100,16 +134,6 @@ MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
 ```
 
 Open **http://localhost:9000** — same UI as Mac.
-
-Training auto-detects CUDA, so running `train_act.py` on the host will use the GPU automatically:
-
-```bash
-python3 training/train_act.py \
-    --dataset_dir data/datasets/xarm_lift_v1 \
-    --output_dir  data/checkpoints/xarm_lift_v1 \
-    --epochs 200
-# Device: cuda  ← printed automatically if CUDA is available
-```
 
 ---
 
@@ -122,7 +146,8 @@ publishes observations as ROS2 topics:
 
 | Topic | Type | Description |
 |---|---|---|
-| `/sim/camera/image_compressed` | `CompressedImage` | Top-view camera @ 30 Hz |
+| `/sim/camera/image_compressed` | `CompressedImage` | Top-view camera @ 30 Hz (ACT policy input) |
+| `/sim/camera/wrist/image_compressed` | `CompressedImage` | Wrist-view camera @ 30 Hz (display only) |
 | `/sim/joint_states` | `JointState` | 32D proprioceptive state vector |
 | `/sim/ee_pose` | `PoseStamped` | End-effector position |
 | `/sim/wrench` | `WrenchStamped` | Force/torque at EEF |
@@ -163,8 +188,6 @@ The `teleop_node` converts these to Cartesian delta targets on `/sim/joint_comma
 
 <video src="https://github.com/user-attachments/assets/8e97411a-15f9-41af-8d88-9b3c74941abf" autoplay loop muted playsinline width="100%"></video>
 
-
-
 1. Click **▶ Start Demo** → calls `/recording/start`
 2. Use the joystick to pick the cube and place it on the target
 3. Click **⏹ Stop Demo** → calls `/recording/stop`, saves bag to `/data/bags/`
@@ -172,52 +195,20 @@ The `teleop_node` converts these to Cartesian delta targets on `/sim/joint_comma
 
 Bags are named `episode_XXXX_YYYYMMDD_HHMMSS/` and contain all five topics at full rate.
 
-Aim for **100+ demonstrations** covering varied cube positions for reliable generalization.
+Aim for **100+ demonstrations** covering varied cube positions. The ACT transformer
+scales better with data than a state-only MLP — more demonstrations directly improve
+the policy's spatial generalisation across the workspace.
 
 ---
 
-### Stage 4 & 5 — Dataset Conversion + Training (Browser)
+### Stage 4 — Dataset Conversion
 
-Click **▶ Train** in the UI. The training manager runs the full pipeline automatically:
-
-1. **Converting** (amber status) — converts all bags in `/data/bags/` to LeRobot
-   Parquet format at `/data/datasets/xarm_lift_v1/`
-2. **Training** (teal status) — trains ACT on the dataset, streams epoch/loss
-   logs and a progress bar to the browser
-
-Tweakable parameters in the UI before clicking Train:
-
-| Parameter | Default | Description |
-|---|---|---|
-| Epochs | 2 | Training epochs (use 2 for pipeline test, 100–200 for quality) |
-| Batch Size | 8 | Samples per gradient step |
-| Learning Rate | 1e-4 | Initial LR (cosine annealed to 0) |
-| Auto-convert bags | ✓ | Runs conversion before training |
-
-**For full-quality training and complete controll over training:
+Convert all recorded bags to LeRobot Parquet format:
 
 ```bash
-python3 training/train_act.py \
-    --dataset_dir data/datasets/xarm_lift_v1 \
-    --output_dir  data/checkpoints/xarm_lift_v1 \
-    --epochs 200 \
-    --batch_size 8 \
-    --lr 1e-4
-```
-
-The best checkpoint (lowest eval loss) is saved to
-`data/checkpoints/xarm_lift_v1/act_xarm_lift.pt`.
-
----
-
-### Stage 4 & 5 — Manual Scripts (alternative to browser)
-
-```bash
-# Convert bags → LeRobot dataset
+# Via browser: click ▶ Train — conversion runs automatically before training
+# Or manually:
 ./scripts/convert_dataset.sh
-
-# Train (Docker CPU)
-./scripts/train.sh
 ```
 
 Output dataset structure (LeRobot v2.1 format):
@@ -238,9 +229,38 @@ data/datasets/xarm_lift_v1/
 
 ---
 
+### Stage 5 — Training the ACT Policy
+
+ACT training requires a GPU. The recommended workflow is to train on a GPU cluster
+and volume-mount the output checkpoint into Docker.
+
+**Train on a GPU cluster:**
+
+```bash
+lerobot-train \
+    --dataset.repo_id=local/xarm_lift \
+    --dataset.root=data/datasets/xarm_lift_v1 \
+    --policy.type=act \
+    --policy.chunk_size=50 \
+    --policy.n_action_steps=10 \
+    --batch_size=8 \
+    --steps=100000 \
+    --output_dir=checkpoints/xarm_act
+```
+
+The checkpoint directory is volume-mounted into Docker
+(`../checkpoints:/data/lerobot_checkpoints`). No rebuild needed after training —
+place the checkpoint in `checkpoints/`, restart the stack, and click **Run Policy**.
+
+The provided checkpoint (`xarm_act_142952`) was trained at H-BRS University,
+100 000 steps, batch size 8, reaching a final eval loss of **0.034**.
+
+---
+
 ### Stage 6 — Policy Deployment
 
-After training, restart Docker so the policy node loads the new checkpoint:
+After training, update `checkpoint_path` in `sim_bringup.launch.py` to point to the
+new checkpoint directory, then restart Docker:
 
 ```bash
 docker compose -f docker/docker-compose.yml restart sim_stack
@@ -250,12 +270,12 @@ Then in the browser:
 
 | Button | Effect |
 |---|---|
-| **▶ Run Policy** | Loads checkpoint (once) + starts 30 Hz ACT inference |
+| **▶ Run Policy** | Loads ACT checkpoint (once) + starts 30 Hz inference |
 | **⏹ Stop Policy** | Stops inference, joystick teleop resumes |
 
-Clicking **Run Policy** again after **Reset Env** always works correctly — the
-node deactivates the previous session, resets the action buffer, and starts
-a fresh inference thread.
+Clicking **Run Policy** again after **Reset Env** always works correctly — the node
+deactivates the previous session, resets the internal action queue, and starts a
+fresh inference thread.
 
 While active, the UI shows:
 
@@ -264,35 +284,12 @@ While active, the UI shows:
 | Policy FPS | Rolling 30-frame average inference rate |
 | Confidence | Mean sigmoid of predicted actions (0–1) |
 
-**Action chunking:** The policy predicts 4 actions at once (`action_horizon=4`)
-and executes them before re-querying — this prevents compounding errors from
-noisy single-step predictions.
-
-**Success rate:** The UI tracks picks per session — each "Run Policy" click is
-one attempt; a successful cube lift increments the counter automatically.
-
----
-
-### Policy Architecture
-
-**State-only (fast baseline):**
-```
-32D proprioceptive state
-       ↓
-  Residual MLP (512 hidden, LayerNorm, GELU)
-       ↓
-  4D EEF delta action  [dx, dy, dz, gripper]
-```
-
-Train with:
-```bash
-python3 training/train_act.py \
-    --dataset_dir data/datasets/xarm_lift_v1 \
-    --output_dir  data/checkpoints/xarm_lift_v1 \
-    --epochs 200
-```
-
-**Vision + State ACT** (ResNet18 + CVAE + transformer decoder, full LeRobot ACT architecture) is available in the `feature/vision-act-cluster-training` branch.
+**Action chunking:** The ACT transformer predicts a chunk of 50 future EEF delta
+actions in a single forward pass. LeRobot's `select_action()` manages an internal
+action queue — it executes `n_action_steps=10` actions from the current chunk before
+calling the transformer again. This means the transformer runs once every 10 control
+ticks, dramatically reducing compute overhead while preserving temporal consistency
+over multi-step pick-and-place trajectories.
 
 ---
 
@@ -313,113 +310,64 @@ The `watchdog_node` monitors three conditions continuously:
 
 ---
 
-## Known Limitations & Future Work
+## Policy Node: Dual Checkpoint Support
 
-This project demonstrates a complete end-to-end IL pipeline. Known gaps and planned improvements:
+`policy_node.py` auto-detects the checkpoint format from the path and loads the
+appropriate policy — no configuration change needed:
 
-**Policy generalisation** — 25 demonstrations is enough to validate the pipeline but real-world robustness requires 100+ episodes covering diverse cube positions. The vision policy (ResNet18 encoder) already helps here by giving the model spatial awareness from the camera.
-
-**Simulation only** — The sim-to-real gap is not addressed. Adapting to a physical xARM6 requires calibrating the action scale, handling camera latency, and domain randomisation during training.
-
-**Action prediction** — The current model predicts a single action per forward pass, repeated for the chunk horizon. True ACT predicts a sequence of T future actions in one shot using a CVAE prior — this would improve temporal consistency over longer horizons.
-
-**No data augmentation** — Adding random crop, colour jitter, and brightness shifts to the image frames during training would improve vision-policy generalisation with the existing 25 demos.
-
-**Checkpoint hot-reload** — After retraining, the policy node requires a Docker restart to load the new weights. A `/policy/reload` service that hot-swaps the checkpoint without restarting would improve the iteration loop.
-
----
-
-## Branch: Vision + Full ACT Training (`feature/vision-act-cluster-training`)
-
-This branch extends the main pipeline with a full [LeRobot](https://github.com/huggingface/lerobot) ACT policy — a transformer-based action chunking model with a ResNet18 vision backbone.
-
-### Policy Architecture
-
-```
-Top camera (480×640 RGB)          32D proprioceptive state
-         ↓                                  ↓
-   ResNet18 encoder                  State encoder MLP
-         ↓                                  ↓
-         └─────────── fused features ───────┘
-                             ↓
-                  CVAE encoder (training only)
-                  Transformer decoder
-                             ↓
-              chunk of 50 future EEF delta actions
-              (execute 10 actions, re-infer, repeat)
-```
-
-| Parameter | Value |
+| `checkpoint_path` points to | Policy loaded |
 |---|---|
-| Vision backbone | ResNet18 (ImageNet pretrained) |
-| Input | Top camera 480×640 + 32D state |
-| Output | 4D EEF delta (dx, dy, dz, gripper) |
-| chunk_size | 50 |
-| n_action_steps | 10 |
-| Training steps | 100 000 |
-| Final loss | 0.034 |
+| A directory (LeRobot format) | Full ACT transformer — ResNet18 + CVAE + transformer decoder |
+| A `.pt` file | Lightweight residual MLP (state-only, produced by browser Train button) |
+
+The node logs which format was detected and prints `chunk_size`, `n_action_steps`,
+and which cameras are active at startup. The same Docker image and browser
+**Run Policy** button works for both.
 
 ---
 
-### What was built
-
-**LeRobot ACT training pipeline**
-
-The dataset collected via the browser is converted to LeRobot v3.0 Parquet format and used to train a full ACT policy with `lerobot-train`. The trained checkpoint is volume-mounted into Docker and loaded by the policy node at startup.
-
-**Dual-format policy node**
-
-`policy_node.py` was extended to support both checkpoint formats with zero configuration change:
-- A LeRobot pretrained directory → full ACT transformer (CVAE + transformer decoder + ResNet18)
-- A local `.pt` file → lightweight MLP (produced by the browser Train button)
-
-The node auto-detects the format from the path and loads accordingly. The same Docker image and browser **Run Policy** button works for both.
-
----
-
-### Getting started
-
-1. Collect demonstrations using the browser (same as main branch).
-
-2. Convert the dataset to LeRobot format and train:
-
-```bash
-lerobot-train \
-    --dataset.repo_id=local/xarm_lift \
-    --dataset.root=data/datasets/xarm_lift_v1 \
-    --policy.type=act \
-    --policy.chunk_size=50 \
-    --policy.n_action_steps=10 \
-    --batch_size=8 \
-    --steps=100000 \
-    --output_dir=checkpoints/xarm_act
-```
-
-3. The checkpoint directory is already volume-mounted in `docker-compose.yml` (`../checkpoints:/data/lerobot_checkpoints`). No rebuild needed — restart the stack and click **Run Policy**.
-
----
-
-### Status
+## Status
 
 | Component | Status |
 |---|---|
-| Data collection → LeRobot v3.0 dataset | ✅ Working |
-| Full ACT training — ResNet18 + CVAE + transformer | ✅ Working — final loss 0.034 |
+| Data collection → LeRobot dataset | ✅ Working |
+| Full ACT training — ResNet18 + CVAE + transformer | ✅ Working — final eval loss 0.034 |
 | Checkpoint loading in Docker | ✅ Working |
 | End-to-end inference in browser | ✅ Working |
 | Robot generalisation (varied cube positions) | ⚠️ Needs more data (100–200 demos) |
 
-The model loads and runs inference without errors. Generalisation to new cube positions requires more demonstrations — 38 episodes is sufficient to validate the full pipeline but the ACT transformer needs 100–200 episodes covering diverse object placements to reliably predict meaningful actions.
+The model loads and runs inference without errors. Generalisation to new cube positions
+requires more demonstrations — 38 episodes validates the full pipeline end-to-end, but
+the ACT transformer needs 100–200 diverse episodes to reliably cover the workspace.
 
 ---
 
-### Planned extensions
+## Known Limitations & Future Work
 
-- **Wrist camera in data collection** — the simulation renders a wrist-mounted camera (`/sim/camera/wrist/image_compressed`) that is not yet recorded or used in training. Adding it as a second image input gives the policy a close-up view of the gripper during grasping.
+**Policy generalisation** — 38 demonstrations is enough to validate the pipeline but
+real-world robustness requires 100–200 episodes covering diverse cube positions. The
+ResNet18 vision backbone gives the policy spatial awareness from the top camera, but
+more data is needed for reliable workspace coverage.
 
-- **Train mode selection in browser** — the Train button should offer a choice between state-only (fast, few demos) and full ACT with vision (higher capacity, needs 100+ demos), launching the correct pipeline automatically.
+**Simulation only** — The sim-to-real gap is not addressed. Adapting to a physical
+xARM6 requires calibrating the action scale, handling camera latency, and domain
+randomisation during training.
 
-- **Dual checkpoint inference** — when both a `.pt` and a LeRobot checkpoint are present, the Run Policy button should let the user select which to run rather than defaulting to the launch file value.
+**Wrist camera not used in training** — The simulation renders a wrist-mounted camera
+(`/sim/camera/wrist/image_compressed`) that is displayed in the browser but not yet
+included in the training dataset. Adding it as a second image input would give the
+transformer a close-up view of the gripper during grasping and improve grasp precision.
+The policy node already supports dual-camera checkpoints — it reads
+`observation.images.wrist` from config and subscribes to the wrist topic automatically
+when present.
+
+**No data augmentation** — Adding random crop, colour jitter, and brightness shifts
+to image frames during training would improve vision-policy generalisation with the
+existing demonstrations.
+
+**Checkpoint hot-reload** — After retraining, the policy node requires a Docker restart
+to load new weights. A `/policy/reload` service that hot-swaps the checkpoint without
+restarting would improve the iteration loop.
 
 ---
 
@@ -430,10 +378,10 @@ mybotshop_il_demo/
 ├── docker/
 │   ├── docker-compose.yml          # sim_stack + teleop_ui services
 │   └── sim_stack/
-│       ├── Dockerfile              # ROS2 Humble ARM64 + MuJoCo + gym_xarm
+│       ├── Dockerfile              # ROS2 Humble ARM64 + MuJoCo + gym_xarm + lerobot
 │       └── entrypoint.sh
 ├── ros2_ws/src/
-│   ├── sim_bridge/                 # gym_xarm → ROS2 topics
+│   ├── sim_bridge/                 # gym_xarm → ROS2 topics (top + wrist cameras)
 │   │   ├── sim_bridge/xarm_sim_node.py
 │   │   └── launch/sim_bringup.launch.py
 │   ├── teleop_bridge/              # joystick, recording, training manager
@@ -443,22 +391,22 @@ mybotshop_il_demo/
 │   │       └── training_manager.py   ← browser-triggered convert + train
 │   ├── dataset_pipeline/           # rosbag2 → LeRobot Parquet conversion
 │   │   └── dataset_pipeline/rosbag2_to_lerobot.py
-│   ├── policy_lifecycle_manager/   # ACT inference ROS2 lifecycle node
+│   ├── policy_lifecycle_manager/   # LeRobot ACT inference — ROS2 lifecycle node
 │   │   └── policy_lifecycle_manager/policy_node.py
 │   └── safety_watchdog/            # confidence monitor + emergency stop
 │       └── safety_watchdog/watchdog_node.py
 ├── training/
-│   └── train_act.py                # ACT behaviour cloning trainer (MPS/CPU)
+│   └── train_act.py                # state-only MLP baseline (CPU/MPS fallback)
 ├── teleop_ui/
 │   └── index.html                  # standalone browser UI (no framework)
 ├── scripts/
 │   ├── collect_demos.sh            # instructions for demo collection
 │   ├── convert_dataset.sh          # manual bag → dataset conversion
-│   └── train.sh                    # manual training via Docker
+│   └── train.sh                    # manual training script
 └── data/                           # gitignored — bags, datasets, checkpoints
     ├── bags/                       # rosbag2 recordings
     ├── datasets/xarm_lift_v1/      # LeRobot Parquet dataset
-    └── checkpoints/xarm_lift_v1/   # trained ACT checkpoint
+    └── checkpoints/xarm_lift_v1/   # MLP baseline checkpoint (fallback)
 ```
 
 ---
@@ -470,8 +418,8 @@ The pipeline is hardware-agnostic. To adapt to a different arm:
 1. Replace `gym_xarm/XArmLift-v0` in `xarm_sim_node.py` with your simulator
 2. Update `JOINT_NAMES` and action/state space dimensions
 3. Adjust joint limits in `watchdog_node.py`
+4. Retrain the ACT policy on the new demonstration data
 
-Tested simulation backends: gym_xarm (MuJoCo), gym_aloha (MuJoCo), gym_pusht.
 Real robot backends: any ROS2-controlled arm publishing `/joint_states`.
 
 ---
@@ -484,8 +432,11 @@ Real robot backends: any ROS2-controlled arm publishing `/joint_states`.
 | Simulation | gym_xarm 0.1.1 / MuJoCo 2.x |
 | WebSocket bridge | rosbridge_server |
 | Dataset format | LeRobot v2.1 (Apache Parquet + MP4) |
-| Policy | ACT — Action Chunking Transformer |
-| Training device | MPS (Apple M1) or CPU |
+| Vision backbone | ResNet18 (ImageNet pretrained, torchvision) |
+| Policy | LeRobot `ACTPolicy` — CVAE + Transformer decoder + ResNet18 |
+| Action chunking | chunk_size=50, n_action_steps=10 |
+| Training framework | LeRobot (HuggingFace) |
+| Training hardware | GPU cluster (H-BRS University) |
 | Container | Docker ARM64 native for Apple Silicon |
 | Browser UI | Vanilla HTML/JS + ROSLIB.js |
 
