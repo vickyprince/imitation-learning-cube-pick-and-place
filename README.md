@@ -1,5 +1,7 @@
 
 
+
+
 # MYBOTSHOP Imitation Learning Platform
 
 **ROS2-native robotic learning operations platform for xARM6 pick-and-place,
@@ -159,7 +161,7 @@ The `teleop_node` converts these to Cartesian delta targets on `/sim/joint_comma
 
 **Teleoperation data collection via browser joystick:**
 
-<video src="https://github.com/user-attachments/assets/d1f3dc7c-c372-4689-9d5b-4a02cafbce66" autoplay loop muted playsinline width="100%"></video>
+<video src="https://github.com/user-attachments/assets/8e97411a-15f9-41af-8d88-9b3c74941abf" autoplay loop muted playsinline width="100%"></video>
 
 
 
