@@ -69,6 +69,9 @@ def generate_launch_description():
         # ------------------------------------------------------------------ #
         # ACT Policy inference node (ROS2 Lifecycle)
         # Loads trained checkpoint and publishes /sim/joint_command.
+        # checkpoint_path can be:
+        #   - A LeRobot pretrained directory  → full ACT transformer (ResNet18 + CVAE)
+        #   - A local .pt file                → lightweight MLP (browser-trained)
         # Activate via: ros2 lifecycle set /policy_node configure
         #               ros2 lifecycle set /policy_node activate
         # ------------------------------------------------------------------ #
@@ -78,7 +81,7 @@ def generate_launch_description():
             name="policy_node",
             output="screen",
             parameters=[{
-                "checkpoint_path": "/data/checkpoints/xarm_lift_v2/act_xarm_lift.pt",
+                "checkpoint_path": "/data/lerobot_checkpoints/xarm_act_142952",
                 "inference_fps":   30.0,
             }],
         ),
