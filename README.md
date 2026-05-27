@@ -347,125 +347,73 @@ This project demonstrates a complete end-to-end IL pipeline. Known gaps and plan
 
 ---
 
-## Branch: `feature/vision-act-cluster-training`
+## Branch: Vision + Full ACT Training (`feature/vision-act-cluster-training`)
 
-> This branch extends the main pipeline with two things: (1) full
-> [LeRobot](https://github.com/huggingface/lerobot) ACT training on the
-> H-BRS GPU cluster via SLURM, and (2) a dual-format policy node that
-> auto-detects and loads either the lightweight local `.pt` checkpoint or a
-> full LeRobot pretrained directory.
+This branch extends the main pipeline with a full [LeRobot](https://github.com/huggingface/lerobot) ACT policy — a transformer-based action chunking model with a ResNet18 vision backbone — trained on a GPU server.
 
-### What was built
+### What was added
 
-**LeRobot dataset conversion pipeline (`cluster/`)**
+**Full LeRobot ACT training pipeline**
 
-The LeRobot `lerobot-train` command requires a strict v3.0 dataset format.
-The existing v2.1 bags produced by the browser pipeline needed several fixes
-before conversion would succeed. Five repair scripts were written and
-integrated into the SLURM job:
+The dataset collected via the browser pipeline is converted to LeRobot v3.0 format and used to train a proper ACT policy using `lerobot-train`. The trained checkpoint is then loaded by the policy node in Docker for inference.
 
-| Script | Purpose |
-|---|---|
-| `fix_lerobot_parquet.py` | Rewrites per-episode Parquet files with correct PyArrow fixed-size list columns |
-| `fix_lerobot_episodes_stats.py` | Generates `meta/episodes_stats.jsonl` (required by v2.1→v3.0 converter) with correct `(3,1,1)` image stat shapes |
-| `fix_lerobot_stats.py` | Recomputes dataset-level `meta/stats.json` with proper mean/std shapes for normalizer |
-| `fix_lerobot_episodes.py` | Fixes `from_timestamp`/`to_timestamp` frame index bounds |
-| `fix_lerobot_add_index.py` | Adds global `index` column to v3.0 Parquet files (required by LeRobot DataLoader) |
-
-**SLURM training script (`cluster/train_lerobot_act.slurm`)**
-
-End-to-end cluster job that:
-1. Auto-detects dataset version (v2.1 or v3.0) and runs conversion if needed
-2. Runs all five fix scripts in sequence
-3. Calls `lerobot-train` with ACT policy (ResNet18 backbone, chunk_size=50, n_action_steps=10)
-4. Saves checkpoints every 10K steps to `/work/vvicto2s/aic/outputs_main/`
-
-Cluster: H-BRS HPC (`wr0.wr.inf.h-brs.de`), partition `gpu4`, A100 GPU, conda env `aic_lerobot_051`.
+Training configuration:
+- Policy: ACT with ResNet18 vision backbone
+- Input: top camera (480×640) + 32D proprioceptive state
+- Output: 4D EEF delta action (dx, dy, dz, gripper)
+- chunk_size: 50, n_action_steps: 10
+- Training: 100K steps, final loss 0.034
 
 **Dual-format policy node**
 
-`policy_node.py` was extended to auto-detect checkpoint format at load time:
+The policy node was extended to support both checkpoint formats transparently:
+- A local `.pt` file (produced by the browser Train button) → lightweight MLP
+- A LeRobot pretrained directory (produced by `lerobot-train`) → full ACT transformer
 
-```
-checkpoint_path is a .pt file   →  _load_local_pt_policy()
-  Reconstructs ACTMiniPolicy or ACTVisionPolicy from saved state_dict.
-  Wraps in LocalACTWrapper providing select_action() / reset() interface.
-
-checkpoint_path is a directory  →  _load_lerobot_policy()
-  Loads full LeRobot ACTPolicy via ACTPolicy.from_pretrained().
-  Auto-detects wrist camera from config.json input_features.
-```
-
-This means the same Docker image and the same browser "Run Policy" button
-works for both the browser-trained lightweight MLP and the cluster-trained
-full ACT model — no code change or restart required.
+The same Docker image and browser **Run Policy** button works for both — no configuration change required.
 
 ---
 
-### What works
+### Getting started
 
-- Complete data collection → bag → Parquet conversion pipeline with correct non-zero state/action values (root cause of all-zeros was SQLite raw-bytes fallback outside Docker — fixed by running conversion inside Docker with volume-mounted ROS2 environment)
-- All five fix scripts run cleanly and produce a valid LeRobot v3.0 dataset
-- SLURM job completes successfully: **100K steps on A100, final loss 0.034** (job 142952, ~52 min)
-- LeRobot ACTPolicy loads in Docker: `chunk_size=50, n_action_steps=10, cameras=top-only`
-- Policy node handles both checkpoint formats transparently
-- Normalizer buffers (mean/std for state, image, action) correctly injected from the cluster's separate `policy_preprocessor_step_3_normalizer_processor.safetensors` into `model.safetensors` to bridge a LeRobot version mismatch between cluster (newer) and Docker image (older)
+Place the trained LeRobot checkpoint directory under `checkpoints/` and update `checkpoint_path` in `docker/sim_stack/Dockerfile` launch parameters to point to it. Then build and run as normal:
+
+```bash
+docker compose -f docker/docker-compose.yml up --build
+```
+
+To train the full ACT model from your collected dataset:
+
+```bash
+lerobot-train \
+    --dataset.repo_id=local/xarm_lift \
+    --dataset.root=data/datasets/xarm_lift_v1 \
+    --policy.type=act \
+    --policy.chunk_size=50 \
+    --policy.n_action_steps=10 \
+    --batch_size=8 \
+    --steps=100000 \
+    --output_dir=checkpoints/xarm_act
+```
 
 ---
 
-### What is incomplete / known issues
+### Status
 
-**LeRobot ACT inference produces near-zero EEF motion**
-
-After loading successfully, the policy outputs EEF delta actions of ~0.001
-(compared to the ±0.05–0.4 range needed to move the robot). The robot
-stays stationary. The lightweight browser MLP moves the robot correctly.
-
-Root cause analysis:
-- The ACT transformer (ResNet18 + CVAE + decoder) is a high-capacity model
-- Only ~38 demonstration episodes were available for training
-- With limited data, the model converges to predicting near-mean actions
-  (~0 in normalized space → ~0.001 in real space) rather than generalizing
-  to the current observation
-- The browser MLP works because a 4-layer residual MLP overfits beneficially
-  to 38 episodes, directly memorizing state→action mappings
-
-**Fix required:** Collect 100–200 demonstrations covering varied cube
-positions, then retrain. ACT with ResNet18 needs sufficient visual diversity
-to learn a generalizable policy rather than collapsing to a mean prediction.
-
-**LeRobot version compatibility issues encountered (and solved)**
-
-| Issue | Fix applied |
+| Component | Status |
 |---|---|
-| `config.json` fields `use_peft`, `pretrained_path` not recognized by Docker's LeRobot | Stripped from `config.json` |
-| Normalizer buffers missing from `model.safetensors` (stored separately in newer LeRobot) | Merged from preprocessor/postprocessor `.safetensors` files using numpy |
-| `ParameterAlreadyDeclaredException` — launch file and `__init__` both declaring `checkpoint_path` | Wrapped `declare_parameter` in try/except loop |
+| Data collection → LeRobot dataset conversion | ✅ Working |
+| `lerobot-train` ACT training (100K steps) | ✅ Working — final loss 0.034 |
+| Checkpoint loading in Docker | ✅ Working |
+| Policy inference — robot motion | ⚠️ Incomplete |
 
----
+### Known issue — inference produces near-zero motion
 
-### Files added in this branch
+The ACT model loads and runs without errors, but outputs EEF delta actions of ~0.001 (far below the ~0.05–0.4 range needed to move the robot meaningfully). The lightweight MLP from the browser training does move the robot correctly.
 
-```
-cluster/
-├── fix_lerobot_parquet.py          # Parquet column format fix
-├── fix_lerobot_episodes_stats.py   # Generate episodes_stats.jsonl
-├── fix_lerobot_stats.py            # Recompute dataset stats.json
-├── fix_lerobot_episodes.py         # Fix episode timestamp bounds
-├── fix_lerobot_add_index.py        # Add global index column
-└── train_lerobot_act.slurm         # End-to-end SLURM training job
+**Root cause:** The ACT transformer (ResNet18 + CVAE + decoder) is a high-capacity model that requires substantially more training data than the ~38 episodes available. With limited demonstrations it converges to predicting near-mean actions rather than generalising to the current observation.
 
-ros2_ws/src/policy_lifecycle_manager/policy_lifecycle_manager/
-└── policy_node.py                  # Extended: dual-format checkpoint loader
-                                    #   _ACTMiniPolicy, _ACTVisionPolicy,
-                                    #   _LocalACTWrapper, _load_local_pt_policy,
-                                    #   _load_lerobot_policy
-
-docker/docker-compose.yml           # Added lerobot_checkpoints volume mount
-docker/sim_stack/Dockerfile         # CACHE_BUST bumped for colcon rebuilds
-ros2_ws/src/sim_bridge/launch/
-└── sim_bringup.launch.py           # checkpoint_path updated for cluster ckpt
-```
+**Fix:** Collect 100–200 demonstrations and retrain. ACT with a vision backbone typically needs this scale of data to learn a reliable policy.
 
 ---
 
