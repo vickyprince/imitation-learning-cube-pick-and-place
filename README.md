@@ -9,7 +9,7 @@ integrated end-to-end with a browser-based teleoperation UI.**
 > training, and deployment — is driven from the browser. No terminal access
 > is required during normal operation.
 
-**ACT policy inference — autonomous pick-and-place after training:**
+**Policy inference — autonomous pick-and-place after training:**
 
 <video src="https://github.com/user-attachments/assets/6ddb8433-11dd-4262-95a0-f0d665992b32" autoplay loop muted playsinline width="100%"></video>
 
@@ -31,8 +31,8 @@ Stage 1  Simulation       xarm_sim_node    gym_xarm XArmLift-v0 (MuJoCo)
 Stage 2  Teleoperation    teleop_node      /joy → Cartesian delta → gym action
 Stage 3  Recording        recording_manager → rosbag2 bags
 Stage 4  Dataset          rosbag2_to_lerobot → LeRobot Parquet + MP4
-Stage 5  Training         training_manager → train_act.py  (ACT behaviour cloning)
-Stage 6  Deployment       policy_node      ROS2 lifecycle node, ACT inference @ 30 Hz
+Stage 5  Training         training_manager → train_act.py  (state-only behaviour cloning)
+Stage 6  Deployment       policy_node      ROS2 lifecycle node, policy inference @ 30 Hz
 Stage 7  Safety           watchdog_node    confidence + joint limits + manual override
 ```
 
@@ -121,6 +121,7 @@ publishes observations as ROS2 topics:
 | Topic | Type | Description |
 |---|---|---|
 | `/sim/camera/image_compressed` | `CompressedImage` | Top-view camera @ 30 Hz |
+| `/sim/camera/wrist/image_compressed` | `CompressedImage` | Wrist-view camera @ 30 Hz (display only) |
 | `/sim/joint_states` | `JointState` | 32D proprioceptive state vector |
 | `/sim/ee_pose` | `PoseStamped` | End-effector position |
 | `/sim/wrench` | `WrenchStamped` | Force/torque at EEF |
@@ -180,7 +181,7 @@ Click **▶ Train** in the UI. The training manager runs the full pipeline autom
 
 1. **Converting** (amber status) — converts all bags in `/data/bags/` to LeRobot
    Parquet format at `/data/datasets/xarm_lift_v1/`
-2. **Training** (teal status) — trains ACT on the dataset, streams epoch/loss
+2. **Training** (teal status) — trains the policy on the dataset, streams epoch/loss
    logs and a progress bar to the browser
 
 Tweakable parameters in the UI before clicking Train:
@@ -192,7 +193,7 @@ Tweakable parameters in the UI before clicking Train:
 | Learning Rate | 1e-4 | Initial LR (cosine annealed to 0) |
 | Auto-convert bags | ✓ | Runs conversion before training |
 
-**For full-quality training and complete controll over training:
+**For full-quality training and complete control over training:**
 
 ```bash
 python3 training/train_act.py \
@@ -248,7 +249,7 @@ Then in the browser:
 
 | Button | Effect |
 |---|---|
-| **▶ Run Policy** | Loads checkpoint (once) + starts 30 Hz ACT inference |
+| **▶ Run Policy** | Loads checkpoint (once) + starts 30 Hz policy inference |
 | **⏹ Stop Policy** | Stops inference, joystick teleop resumes |
 
 Clicking **Run Policy** again after **Reset Env** always works correctly — the
@@ -262,9 +263,9 @@ While active, the UI shows:
 | Policy FPS | Rolling 30-frame average inference rate |
 | Confidence | Mean sigmoid of predicted actions (0–1) |
 
-**Action chunking:** The policy predicts 4 actions at once (`action_horizon=4`)
-and executes them before re-querying — this prevents compounding errors from
-noisy single-step predictions.
+**Action re-use:** The policy is re-queried every `action_horizon=8` steps; the
+predicted action is held and executed for the full chunk before the next
+inference call. This reduces CPU load and smooths out control jitter at 30 Hz.
 
 ---
 
@@ -305,12 +306,12 @@ mybotshop_il_demo/
 │   │       └── training_manager.py   ← browser-triggered convert + train
 │   ├── dataset_pipeline/           # rosbag2 → LeRobot Parquet conversion
 │   │   └── dataset_pipeline/rosbag2_to_lerobot.py
-│   ├── policy_lifecycle_manager/   # ACT inference ROS2 lifecycle node
+│   ├── policy_lifecycle_manager/   # policy inference ROS2 lifecycle node
 │   │   └── policy_lifecycle_manager/policy_node.py
 │   └── safety_watchdog/            # confidence monitor + emergency stop
 │       └── safety_watchdog/watchdog_node.py
 ├── training/
-│   └── train_act.py                # ACT behaviour cloning trainer (MPS/CPU)
+│   └── train_act.py                # state-only behaviour cloning trainer (CUDA / MPS / CPU)
 ├── teleop_ui/
 │   └── index.html                  # standalone browser UI (no framework)
 ├── scripts/
@@ -320,7 +321,7 @@ mybotshop_il_demo/
 └── data/                           # gitignored — bags, datasets, checkpoints
     ├── bags/                       # rosbag2 recordings
     ├── datasets/xarm_lift_v1/      # LeRobot Parquet dataset
-    └── checkpoints/xarm_lift_v1/   # trained ACT checkpoint
+    └── checkpoints/xarm_lift_v1/   # trained policy checkpoint
 ```
 
 ---
@@ -346,8 +347,8 @@ Real robot backends: any ROS2-controlled arm publishing `/joint_states`.
 | Simulation | gym_xarm 0.1.1 / MuJoCo 2.x |
 | WebSocket bridge | rosbridge_server |
 | Dataset format | LeRobot v2.1 (Apache Parquet + MP4) |
-| Policy | ACT — Action Chunking Transformer |
-| Training device | MPS (Apple M1) or CPU |
+| Policy | Residual MLP — 4-layer state-only behaviour cloning (`ACTMiniPolicy`) |
+| Training device | CUDA / MPS (Apple M1) / CPU (auto-detected) |
 | Container | Docker ARM64 native for Apple Silicon |
 | Browser UI | Vanilla HTML/JS + ROSLIB.js |
 
