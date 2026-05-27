@@ -52,7 +52,7 @@ Top camera (480×640 RGB)          32D proprioceptive state
 | Training framework | LeRobot (HuggingFace) |
 | Training steps | 100 000 |
 | Final eval loss | 0.034 |
-| Checkpoint | `xarm_act_142952` (H-BRS University GPU cluster) |
+| Checkpoint | Produced by `lerobot-train --output_dir=checkpoints/<name>` |
 
 ---
 
@@ -86,9 +86,15 @@ git clone -b feature/vision-act-cluster-training \
 cd imitation-learning-cube-pick-and-place
 ```
 
-The LeRobot ACT checkpoint must be present at `checkpoints/xarm_act_142952/` before
-starting Docker. The `docker-compose.yml` volume-mounts `../checkpoints` into the
-container at `/data/lerobot_checkpoints/`.
+No checkpoint is needed to start. The full workflow is:
+
+1. Run Docker → collect demonstrations in the browser → dataset is saved under `data/`
+2. Train the ACT policy with `lerobot-train` (see Stage 5) → checkpoint is saved under `checkpoints/`
+3. Restart Docker → click **Run Policy** → the checkpoint is volume-mounted automatically
+
+The `docker-compose.yml` mounts `../checkpoints` into the container at
+`/data/lerobot_checkpoints/`, so any checkpoint trained locally is immediately
+available without a rebuild.
 
 ---
 
@@ -102,7 +108,8 @@ docker compose -f docker/docker-compose.yml up
 ```
 
 Open **http://localhost:9000** — no login required. The top-view and wrist camera feeds
-appear within a few seconds. Click **▶ Run Policy** to start ACT inference.
+appear within a few seconds. Collect demonstrations, train the ACT policy (Stage 5),
+then click **▶ Run Policy** to start inference.
 
 ---
 
@@ -250,17 +257,19 @@ lerobot-train \
 
 The checkpoint directory is volume-mounted into Docker
 (`../checkpoints:/data/lerobot_checkpoints`). No rebuild needed after training —
-place the checkpoint in `checkpoints/`, restart the stack, and click **Run Policy**.
+once the checkpoint lands in `checkpoints/`, update `checkpoint_path` in
+`sim_bringup.launch.py`, restart the stack, and click **Run Policy**.
 
-The provided checkpoint (`xarm_act_142952`) was trained at H-BRS University,
+The reference checkpoint for this project was trained at H-BRS University on a GPU cluster,
 100 000 steps, batch size 8, reaching a final eval loss of **0.034**.
 
 ---
 
 ### Stage 6 — Policy Deployment
 
-After training, update `checkpoint_path` in `sim_bringup.launch.py` to point to the
-new checkpoint directory, then restart Docker:
+After `lerobot-train` completes, the checkpoint directory is already under `checkpoints/`
+and volume-mounted into Docker. Update `checkpoint_path` in `sim_bringup.launch.py`
+to match the directory name, then restart Docker:
 
 ```bash
 docker compose -f docker/docker-compose.yml restart sim_stack
