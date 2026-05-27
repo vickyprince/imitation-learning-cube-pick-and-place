@@ -273,8 +273,6 @@ one attempt; a successful cube lift increments the counter automatically.
 
 ### Policy Architecture
 
-Two modes are supported — the checkpoint auto-selects which model to load at inference time.
-
 **State-only (fast baseline):**
 ```
 32D proprioceptive state
@@ -284,33 +282,15 @@ Two modes are supported — the checkpoint auto-selects which model to load at i
   4D EEF delta action  [dx, dy, dz, gripper]
 ```
 
-**Vision + State (best accuracy):**
-```
-Camera image (84×84 RGB)          32D proprioceptive state
-       ↓                                    │
-  ResNet18 backbone                         │
-  (ImageNet pretrained,                     │
-   fine-tuned end-to-end)                   │
-       ↓                                    │
-  Linear projection → 128D                 │
-       └──────────── concat ───────────────┘
-                        ↓
-            Residual MLP (512 hidden)
-                        ↓
-            4D EEF delta action
-```
-
-Train with `--vision` flag:
-
+Train with:
 ```bash
 python3 training/train_act.py \
     --dataset_dir data/datasets/xarm_lift_v1 \
     --output_dir  data/checkpoints/xarm_lift_v1 \
-    --epochs 200 --vision
+    --epochs 200
 ```
 
-The policy node reads `use_vision` from the checkpoint and automatically
-instantiates the correct model — no config change needed.
+**Vision + State** (ResNet18 camera encoder fused with proprioceptive state) is available in the `feature/vision-act-cluster-training` branch.
 
 ---
 
@@ -376,13 +356,7 @@ The same Docker image and browser **Run Policy** button works for both — no co
 
 ### Getting started
 
-Place the trained LeRobot checkpoint directory under `checkpoints/` and update `checkpoint_path` in `docker/sim_stack/Dockerfile` launch parameters to point to it. Then build and run as normal:
-
-```bash
-docker compose -f docker/docker-compose.yml up --build
-```
-
-To train the full ACT model from your collected dataset:
+Collect demonstrations using the browser pipeline (same as main branch), then train:
 
 ```bash
 lerobot-train \
@@ -396,6 +370,8 @@ lerobot-train \
     --output_dir=checkpoints/xarm_act
 ```
 
+Place the output directory under `checkpoints/`, update the `checkpoint_path` in `ros2_ws/src/sim_bridge/launch/sim_bringup.launch.py`, and rebuild Docker. The policy node detects the directory format automatically and loads the LeRobot checkpoint without any further changes.
+
 ---
 
 ### Status
@@ -403,17 +379,27 @@ lerobot-train \
 | Component | Status |
 |---|---|
 | Data collection → LeRobot dataset conversion | ✅ Working |
-| `lerobot-train` ACT training (100K steps) | ✅ Working — final loss 0.034 |
+| Full ACT training (100K steps, ResNet18 + transformer) | ✅ Working — final loss 0.034 |
 | Checkpoint loading in Docker | ✅ Working |
 | Policy inference — robot motion | ⚠️ Incomplete |
 
 ### Known issue — inference produces near-zero motion
 
-The ACT model loads and runs without errors, but outputs EEF delta actions of ~0.001 (far below the ~0.05–0.4 range needed to move the robot meaningfully). The lightweight MLP from the browser training does move the robot correctly.
+The ACT model loads and runs without errors but outputs near-zero EEF delta actions, so the robot barely moves. The state+vision MLP from the browser Train button does move the robot correctly.
 
-**Root cause:** The ACT transformer (ResNet18 + CVAE + decoder) is a high-capacity model that requires substantially more training data than the ~38 episodes available. With limited demonstrations it converges to predicting near-mean actions rather than generalising to the current observation.
+**Root cause:** The full ACT transformer is a high-capacity model that needs substantially more data than the ~38 episodes used here. With limited demonstrations it converges to predicting near-mean actions rather than generalising to new observations.
 
-**Fix:** Collect 100–200 demonstrations and retrain. ACT with a vision backbone typically needs this scale of data to learn a reliable policy.
+**Fix:** Collect 100–200 demonstrations and retrain. This scale of data is the standard recommendation for ACT with a vision backbone.
+
+---
+
+### Planned extensions (not yet implemented)
+
+- **Wrist camera in data collection** — the simulation already renders a wrist camera (`/sim/camera/wrist/image_compressed`) but it is not yet recorded during demonstrations or used in training. Adding it as a second input would give the policy a close-up view of the gripper and object, which significantly improves grasp precision.
+
+- **Train mode selection in browser** — the Train button currently always runs the lightweight MLP. It should offer a choice: state-only (fast, works with few demos) or full ACT with vision (higher accuracy, needs 100+ demos). The correct pipeline would launch automatically based on the selection.
+
+- **Dual checkpoint inference** — if both a lightweight `.pt` checkpoint and a LeRobot ACT directory are present, the Run Policy button should let the user choose which to run rather than always loading whichever path is hardcoded in the launch file.
 
 ---
 

@@ -78,9 +78,8 @@ def generate_launch_description():
             name="policy_node",
             output="screen",
             parameters=[{
-                "checkpoint_path": "/data/checkpoints/xarm_lift_v1/act_xarm_lift.pt",
+                "checkpoint_path": "/data/checkpoints/xarm_lift_v2/act_xarm_lift.pt",
                 "inference_fps":   30.0,
-                "action_horizon":  8,
             }],
         ),
 
